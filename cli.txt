@@ -1,0 +1,11 @@
+./adaptssp.exe instance_n16.txt "347884" 0 60 --calibrate_s=0
+./adaptssp.exe instance_n24.txt "139114178" 0 60 --calibrate_s=0
+./adaptssp.exe instance_n32.txt "48449542436" 0 60 --calibrate_s=0
+./adaptssp.exe instance_n40.txt "17382594727021" 0 60 --calibrate_s=0
+./adaptssp.exe instance_n48.txt "5155355369399890" 0 60 --calibrate_s=0
+./adaptssp.exe instance_n56.txt "1572440360392835502" 0 60 --calibrate_s=0
+./adaptssp.exe instance_n64.txt "436589933519270547208" 0 60 --calibrate_s=0
+./adaptssp.exe instance_n72.txt "122798200694866312882677" 0 60 --calibrate_s=0
+./adaptssp.exe instance_n80.txt "36467965901708499782779033" 0 60 --calibrate_s=0
+./adaptssp.exe instance_n88.txt "10227952868229738527976647602" 0 60 --calibrate_s=0
+./adaptssp.exe instance_n96.txt "2885139962834542255881671728668" 0 60 --calibrate_s=0
