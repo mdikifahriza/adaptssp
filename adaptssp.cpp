@@ -134,13 +134,13 @@ struct Instance {
 // Data Structures
 // ============================================================================
 struct BaseListSoA {
-    std::vector<u64>  rem;
+    std::vector<u32>  rem;
     std::vector<u32>  mask;
     std::vector<u128> sum;
     void clear() { rem.clear(); mask.clear(); sum.clear(); }
     void reserve(size_t n) { rem.reserve(n); mask.reserve(n); sum.reserve(n); }
     size_t size() const { return rem.size(); }
-    inline void push(u128 s, u32 m, u64 r) { sum.push_back(s); mask.push_back(m); rem.push_back(r); }
+    inline void push(u128 s, u32 m, u32 r) { sum.push_back(s); mask.push_back(m); rem.push_back(r); }
 };
 
 struct BaseEntry {
@@ -559,24 +559,24 @@ private:
     // ------------------------------------------------------------------------
     // Engine 2: N >= 48 (HGJ Modulo M Representation - Anti-OOM)
     // ------------------------------------------------------------------------
-    static void gen_recursive_large(int pos, int remaining_k, u128 cur_sum, u64 cur_rem, u32 cur_mask,
-                                     const std::vector<u128>& A, const std::vector<u64>& A_rem,
-                                     int q_n, u64 M, BaseListSoA& out) {
+    static void gen_recursive_large(int pos, int remaining_k, u128 cur_sum, u32 cur_rem, u32 cur_mask,
+                                     const std::vector<u128>& A, const std::vector<u32>& A_rem,
+                                     int q_n, u32 M, BaseListSoA& out) {
         if (remaining_k == 0) { out.push(cur_sum, cur_mask, cur_rem); return; }
         if (pos >= q_n || (q_n - pos) < remaining_k) return;
         gen_recursive_large(pos + 1, remaining_k, cur_sum, cur_rem, cur_mask, A, A_rem, q_n, M, out);
-        u64 new_rem = cur_rem + A_rem[pos];
+        u32 new_rem = cur_rem + A_rem[pos];
         if (new_rem >= M) new_rem -= M;
         gen_recursive_large(pos + 1, remaining_k - 1, cur_sum + A[pos], new_rem,
                             cur_mask | (1U << pos), A, A_rem, q_n, M, out);
     }
-    static void gen_combinations_large(const std::vector<u128>& A, const std::vector<u64>& A_rem,
-                                        int q_n, int q_k, u64 M, BaseListSoA& out) {
-        gen_recursive_large(0, q_k, (u128)0, (u64)0, (u32)0, A, A_rem, q_n, M, out);
+    static void gen_combinations_large(const std::vector<u128>& A, const std::vector<u32>& A_rem,
+                                        int q_n, int q_k, u32 M, BaseListSoA& out) {
+        gen_recursive_large(0, q_k, (u128)0, (u32)0, (u32)0, A, A_rem, q_n, M, out);
     }
 
     static void radix_sort_by_rem(BaseListSoA& list, std::vector<u32>& idx, std::vector<u32>& idx_tmp,
-                                   std::vector<u64>& buf_rem, std::vector<u32>& buf_mask, std::vector<u128>& buf_sum,
+                                   std::vector<u32>& buf_rem, std::vector<u32>& buf_mask, std::vector<u128>& buf_sum,
                                    int total_bits) {
         size_t n = list.size();
         if (n < 2) return;
@@ -613,7 +613,7 @@ private:
     }
 
     static void merge_quarters_sweep_large(const BaseListSoA& list1, const BaseListSoA& list2,
-                                           u64 target_mod, u64 M, u128 lower_bound, u128 upper_bound,
+                                           u32 target_mod, u32 M, u128 lower_bound, u128 upper_bound,
                                            std::vector<HalfEntry>& out_cand, int q_n,
                                            const std::atomic<bool>& solution_found) {
         size_t N1 = list1.size(), N2 = list2.size();
@@ -625,7 +625,7 @@ private:
         while (j >= 0 && rem2[j] > target_mod) j--;
         while (i < N1 && rem1[i] <= target_mod && j >= 0) {
             if (solution_found.load(std::memory_order_relaxed)) return;
-            u64 s = rem1[i] + rem2[j];
+            u32 s = rem1[i] + rem2[j];
             if (s < target_mod) i++;
             else if (s > target_mod) j--;
             else {
@@ -640,12 +640,12 @@ private:
                 i = i2; j = j2;
             }
         }
-        u64 target2 = target_mod + M;
+        u32 target2 = target_mod + M;
         i = 0; while (i < N1 && rem1[i] <= target_mod) i++;
         j = (int64_t)N2 - 1;
         while (i < N1 && j >= 0 && rem2[j] > target_mod) {
             if (solution_found.load(std::memory_order_relaxed)) return;
-            u64 s = rem1[i] + rem2[j];
+            u32 s = rem1[i] + rem2[j];
             if (s < target2) i++;
             else if (s > target2) j--;
             else {
@@ -677,7 +677,7 @@ private:
         if (num_threads == 0) num_threads = std::max(1u, std::thread::hardware_concurrency());
         report.threads_used = num_threads;
 
-        u64 M;
+        u32 M;
         if (est_combinations <= 15) M = 31;
         else if (est_combinations <= 50) M = 61;
         else if (est_combinations <= 150) M = 127;
@@ -688,7 +688,7 @@ private:
         else if (est_combinations <= 80000) M = 65537;
         else if (est_combinations <= 300000) M = 262139;
         else if (est_combinations <= 1000000) M = 1048573;
-        else M = 35989843ULL;
+        else M = 35989843U;
 
         int radix_bits_total = 1;
         while ((1ULL << radix_bits_total) < M) radix_bits_total++;
@@ -723,7 +723,7 @@ private:
             std::vector<u32> idx_buf, idx_tmp;
             idx_buf.reserve(est_combinations); idx_tmp.reserve(est_combinations);
 
-            std::vector<u64> buf_rem; std::vector<u32> buf_mask; std::vector<u128> buf_sum;
+            std::vector<u32> buf_rem; std::vector<u32> buf_mask; std::vector<u128> buf_sum;
             buf_rem.reserve(est_combinations); buf_mask.reserve(est_combinations); buf_sum.reserve(est_combinations);
 
             std::vector<HalfEntry> cand_L, cand_R;
@@ -731,7 +731,7 @@ private:
             cand_L.reserve(est_cand); cand_R.reserve(est_cand);
 
             std::vector<u128> Q1(q_n), Q2(q_n), Q3(q_n), Q4(q_n);
-            std::vector<u64>  Q1r(q_n), Q2r(q_n), Q3r(q_n), Q4r(q_n);
+            std::vector<u32>  Q1r(q_n), Q2r(q_n), Q3r(q_n), Q4r(q_n);
             std::vector<u128> Left_elem(2 * q_n), Right_elem(2 * q_n);
 
             u64 local_partitions = 0, local_queries = 0, local_base_entries = 0;
@@ -774,10 +774,10 @@ private:
 
                 L1.clear(); L2.clear(); R1.clear(); R2.clear();
                 for (int i = 0; i < q_n; ++i) {
-                    Q1r[i] = (u64)(Q1[i] % (u128)M);
-                    Q2r[i] = (u64)(Q2[i] % (u128)M);
-                    Q3r[i] = (u64)(Q3[i] % (u128)M);
-                    Q4r[i] = (u64)(Q4[i] % (u128)M);
+                    Q1r[i] = (u32)(Q1[i] % (u128)M);
+                    Q2r[i] = (u32)(Q2[i] % (u128)M);
+                    Q3r[i] = (u32)(Q3[i] % (u128)M);
+                    Q4r[i] = (u32)(Q4[i] % (u128)M);
                 }
                 gen_combinations_large(Q1, Q1r, q_n, q_k, M, L1);
                 gen_combinations_large(Q2, Q2r, q_n, q_k, M, L2);
@@ -790,11 +790,11 @@ private:
                 radix_sort_by_rem(R1, idx_buf, idx_tmp, buf_rem, buf_mask, buf_sum, radix_bits_total);
                 radix_sort_by_rem(R2, idx_buf, idx_tmp, buf_rem, buf_mask, buf_sum, radix_bits_total);
 
-                u64 target_mod = (u64)(inst.target % (u128)M);
+                u32 target_mod = (u32)(inst.target % (u128)M);
 
-                for (u64 R_mod = 0; R_mod < M && !solution_found; ++R_mod) {
+                for (u32 R_mod = 0; R_mod < M && !solution_found; ++R_mod) {
                     local_queries++;
-                    u64 R_comp_mod = (target_mod >= R_mod)
+                    u32 R_comp_mod = (target_mod >= R_mod)
                         ? (target_mod - R_mod)
                         : (M - (R_mod - target_mod));
 

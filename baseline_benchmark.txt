@@ -1,9 +1,10 @@
 ================================================================================
                      BASELINE BENCHMARK ADAPTSSP (N=16 - N=64)
 ================================================================================
-Waktu Pengujian : 2026-09-13 18:37:59 (Updated N=64: 18:42:44)
-Metodologi      : Sekuensial, 3x Pengulangan per Instance
-Parameter CLI   : threads=0 (auto), timeout=60s, --calibrate_s=0
+Waktu Pengujian : 2026-09-13 19:35:00
+Metodologi      : Sekuensial via Terminal, 3x Pengulangan per Instance
+Versi Kode      : Optimasi Selektif u32 rem (BaseListSoA & Engine 2)
+Parameter CLI   : threads=0 (auto), --calibrate_s=0, timeout: 60s (N<=48), 120s (N=56, N=64)
 Sumber Perintah : cli.txt (baris 1 s/d 7)
 ================================================================================
 
@@ -12,69 +13,71 @@ Sumber Perintah : cli.txt (baris 1 s/d 7)
 Instance           | N   | Status             | Run 1 (s) | Run 2 (s) | Run 3 (s) | Avg (s)  | Max RAM   
 ----------------------------------------------------------------------------------------
 instance_n16.txt   | 16  | SOLVED (3/3)       | 0.00      | 0.00      | 0.00      | 0.00     | 4.92    MB
-instance_n24.txt   | 24  | SOLVED (3/3)       | 0.00      | 0.00      | 0.00      | 0.00     | 5.00    MB
-instance_n32.txt   | 32  | SOLVED (3/3)       | 0.01      | 0.01      | 0.00      | 0.01     | 6.18    MB
-instance_n40.txt   | 40  | SOLVED (3/3)       | 0.03      | 0.03      | 0.05      | 0.04     | 18.34   MB
-instance_n48.txt   | 48  | SOLVED (3/3)       | 4.09      | 1.36      | 4.18      | 3.21     | 6.12    MB
-instance_n56.txt   | 56  | SOLVED (3/3)       | 49.22     | 19.52     | 49.62     | 39.45    | 8.07    MB
-instance_n64.txt   | 64  | NOT SOLVED (0/3)   | 69.42     | 70.06     | 72.28     | 70.59    | 15.22   MB
+instance_n24.txt   | 24  | SOLVED (3/3)       | 0.00      | 0.00      | 0.00      | 0.00     | 5.12    MB
+instance_n32.txt   | 32  | SOLVED (3/3)       | 0.01      | 0.01      | 0.00      | 0.01     | 6.15    MB
+instance_n40.txt   | 40  | SOLVED (3/3)       | 0.01      | 0.16      | 0.08      | 0.08     | 19.38   MB
+instance_n48.txt   | 48  | SOLVED (3/3)       | 3.34      | 0.61      | 0.64      | 1.53     | 6.09    MB
+instance_n56.txt   | 56  | SOLVED (2/3)       | 44.35     | 121.82(TO)| 35.71     | 40.03*   | 7.98    MB
+instance_n64.txt   | 64  | SOLVED (1/3)       | 129.02(TO)| 129.70(TO)| 77.71     | 77.71*   | 14.20   MB
 ----------------------------------------------------------------------------------------
+*Catatan: Nilai Avg pada N=56 dan N=64 adalah rata-rata run yang berhasil dipecahkan sebelum timeout 120s.
 
 ### RINCIAN EKSEKUSI PER RUN
 ================================================================================
 
 [INSTANCE: instance_n16.txt | N=16 | Target=347884]
 Engine Mode : TWO-POINTER SORT-BY-SUM (Optimized for N <= 40)
-  Run 1: Status=SOLVED (verified) | Runtime=0.00s | Peak RAM=4.89 MB | Partisi=5
-  Run 2: Status=SOLVED (verified) | Runtime=0.00s | Peak RAM=4.92 MB | Partisi=9
-  Run 3: Status=SOLVED (verified) | Runtime=0.00s | Peak RAM=4.91 MB | Partisi=3
+  Run 1: Status=SOLVED (verified) | Runtime=0.00s | Peak RAM=4.92 MB | Partisi=28
+  Run 2: Status=SOLVED (verified) | Runtime=0.00s | Peak RAM=4.92 MB | Partisi=6
+  Run 3: Status=SOLVED (verified) | Runtime=0.00s | Peak RAM=4.90 MB | Partisi=16
   -> Rata-rata Runtime : 0.00 s
-  -> Rata-rata RAM     : 4.91 MB
+  -> Max RAM           : 4.92 MB
 
 [INSTANCE: instance_n24.txt | N=24 | Target=139114178]
 Engine Mode : TWO-POINTER SORT-BY-SUM (Optimized for N <= 40)
-  Run 1: Status=SOLVED (verified) | Runtime=0.00s | Peak RAM=4.97 MB | Partisi=24
-  Run 2: Status=SOLVED (verified) | Runtime=0.00s | Peak RAM=5.00 MB | Partisi=11
-  Run 3: Status=SOLVED (verified) | Runtime=0.00s | Peak RAM=4.96 MB | Partisi=7
+  Run 1: Status=SOLVED (verified) | Runtime=0.00s | Peak RAM=5.04 MB | Partisi=27
+  Run 2: Status=SOLVED (verified) | Runtime=0.00s | Peak RAM=4.94 MB | Partisi=2
+  Run 3: Status=SOLVED (verified) | Runtime=0.00s | Peak RAM=5.12 MB | Partisi=12
   -> Rata-rata Runtime : 0.00 s
-  -> Rata-rata RAM     : 4.98 MB
+  -> Max RAM           : 5.12 MB
 
 [INSTANCE: instance_n32.txt | N=32 | Target=48449542436]
 Engine Mode : TWO-POINTER SORT-BY-SUM (Optimized for N <= 40)
-  Run 1: Status=SOLVED (verified) | Runtime=0.01s | Peak RAM=6.18 MB | Partisi=22
-  Run 2: Status=SOLVED (verified) | Runtime=0.01s | Peak RAM=6.18 MB | Partisi=23
+  Run 1: Status=SOLVED (verified) | Runtime=0.01s | Peak RAM=6.14 MB | Partisi=31
+  Run 2: Status=SOLVED (verified) | Runtime=0.01s | Peak RAM=6.15 MB | Partisi=47
   Run 3: Status=SOLVED (verified) | Runtime=0.00s | Peak RAM=6.15 MB | Partisi=4
   -> Rata-rata Runtime : 0.01 s
-  -> Rata-rata RAM     : 6.17 MB
+  -> Max RAM           : 6.15 MB
 
 [INSTANCE: instance_n40.txt | N=40 | Target=17382594727021]
 Engine Mode : TWO-POINTER SORT-BY-SUM (Optimized for N <= 40)
-  Run 1: Status=SOLVED (verified) | Runtime=0.03s | Peak RAM=17.46 MB | Partisi=9
-  Run 2: Status=SOLVED (verified) | Runtime=0.03s | Peak RAM=18.28 MB | Partisi=13
-  Run 3: Status=SOLVED (verified) | Runtime=0.05s | Peak RAM=18.34 MB | Partisi=22
-  -> Rata-rata Runtime : 0.04 s
-  -> Rata-rata RAM     : 18.03 MB
+  Run 1: Status=SOLVED (verified) | Runtime=0.01s | Peak RAM=16.62 MB | Partisi=6
+  Run 2: Status=SOLVED (verified) | Runtime=0.16s | Peak RAM=19.38 MB | Partisi=66
+  Run 3: Status=SOLVED (verified) | Runtime=0.08s | Peak RAM=19.01 MB | Partisi=30
+  -> Rata-rata Runtime : 0.08 s
+  -> Max RAM           : 19.38 MB
 
 [INSTANCE: instance_n48.txt | N=48 | Target=5155355369399890]
-Engine Mode : HGJ MODULO M (Anti-OOM, Optimized for N >= 48)
-  Run 1: Status=SOLVED (verified) | Runtime=4.09s | Peak RAM=5.93 MB | Partisi=99
-  Run 2: Status=SOLVED (verified) | Runtime=1.36s | Peak RAM=5.92 MB | Partisi=33
-  Run 3: Status=SOLVED (verified) | Runtime=4.18s | Peak RAM=6.12 MB | Partisi=92
-  -> Rata-rata Runtime : 3.21 s
-  -> Rata-rata RAM     : 5.99 MB
+Engine Mode : HGJ MODULO M (Anti-OOM, u32 rem)
+  Run 1: Status=SOLVED (verified) | Runtime=3.34s | Peak RAM=5.88 MB | Partisi=80
+  Run 2: Status=SOLVED (verified) | Runtime=0.61s | Peak RAM=5.88 MB | Partisi=16
+  Run 3: Status=SOLVED (verified) | Runtime=0.64s | Peak RAM=6.09 MB | Partisi=16
+  -> Rata-rata Runtime : 1.53 s
+  -> Max RAM           : 6.09 MB
 
 [INSTANCE: instance_n56.txt | N=56 | Target=1572440360392835502]
-Engine Mode : HGJ MODULO M (Anti-OOM, Optimized for N >= 48)
-  Run 1: Status=SOLVED (verified) | Runtime=49.22s | Peak RAM=8.07 MB | Partisi=56
-  Run 2: Status=SOLVED (verified) | Runtime=19.52s | Peak RAM=8.03 MB | Partisi=24
-  Run 3: Status=SOLVED (verified) | Runtime=49.62s | Peak RAM=7.96 MB | Partisi=60
-  -> Rata-rata Runtime : 39.45 s
-  -> Rata-rata RAM     : 8.02 MB
+Engine Mode : HGJ MODULO M (Anti-OOM, u32 rem) | Timeout: 120s
+  Run 1: Status=SOLVED (verified) | Runtime=44.35s | Peak RAM=7.79 MB | Partisi=56
+  Run 2: Status=NOT SOLVED (Timeout) | Runtime=121.82s | Peak RAM=7.98 MB | Partisi=148
+  Run 3: Status=SOLVED (verified) | Runtime=35.71s | Peak RAM=7.79 MB | Partisi=44
+  -> Rata-rata Solved  : 40.03 s
+  -> Max RAM           : 7.98 MB
 
 [INSTANCE: instance_n64.txt | N=64 | Target=436589933519270547208]
-Engine Mode : HGJ MODULO M (Anti-OOM, Optimized for N >= 48)
-  Run 1: Status=NOT SOLVED | Runtime=69.42s | Peak RAM=15.22 MB | Partisi=4
-  Run 2: Status=NOT SOLVED | Runtime=70.06s | Peak RAM=15.13 MB | Partisi=4
-  Run 3: Status=NOT SOLVED | Runtime=72.28s | Peak RAM=15.08 MB | Partisi=4
-  -> Rata-rata Runtime : 70.59 s
-  -> Rata-rata RAM     : 15.14 MB
+Engine Mode : HGJ MODULO M (Anti-OOM, u32 rem) | Timeout: 120s
+  Run 1: Status=NOT SOLVED (Timeout) | Runtime=129.02s | Peak RAM=14.20 MB | Partisi=8
+  Run 2: Status=NOT SOLVED (Timeout) | Runtime=129.70s | Peak RAM=14.03 MB | Partisi=8
+  Run 3: Status=SOLVED (verified) | Runtime=77.71s | Peak RAM=14.03 MB | Partisi=8
+  -> Saksi (32 indeks): [3, 4, 5, 8, 10, 12, 13, 15, 16, 19, 23, 25, 27, 30, 31, 33, 34, 35, 36, 38, 42, 46, 47, 48, 49, 51, 53, 54, 56, 58, 59, 63]
+  -> Waktu Pecah       : 77.71 s
+  -> Max RAM           : 14.20 MB
