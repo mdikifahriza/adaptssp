@@ -187,90 +187,28 @@ inline bool verify_witness(const std::vector<u128>& elements, u128 target, int e
 }
 
 // ============================================================================
-// ENGINE 1: Exact Meet-in-the-Middle (Fast for N <= 44)
-// ============================================================================
-namespace EngineSmall {
-    struct Entry {
-        u128 sum;
-        u32 mask;
-    };
-
-    static void gen_half(const std::vector<u128>& arr, int start_idx, int count,
-                         std::vector<Entry>& out) {
-        size_t total = 1ULL << count;
-        out.resize(total);
-        out[0] = {0, 0};
-        for (int i = 0; i < count; ++i) {
-            size_t cur_len = 1ULL << i;
-            u128 val = arr[start_idx + i];
-            u32 bit = 1U << i;
-            for (size_t j = 0; j < cur_len; ++j) {
-                out[cur_len + j].sum = out[j].sum + val;
-                out[cur_len + j].mask = out[j].mask | bit;
-            }
-        }
-    }
-
-    static Report solve(const Instance& inst, unsigned num_threads, double time_limit_s) {
-        Report report;
-        auto start_time = std::chrono::steady_clock::now();
-        int n = (int)inst.elements.size();
-        int n1 = n / 2;
-        int n2 = n - n1;
-
-        std::vector<Entry> L1, L2;
-        gen_half(inst.elements, 0, n1, L1);
-        gen_half(inst.elements, n1, n2, L2);
-
-        report.base_combinations_generated = L1.size() + L2.size();
-
-        std::sort(L2.begin(), L2.end(), [](const Entry& a, const Entry& b) {
-            return a.sum < b.sum;
-        });
-
-        for (const auto& e1 : L1) {
-            if (e1.sum > inst.target) continue;
-            u128 req = inst.target - e1.sum;
-
-            auto it = std::lower_bound(L2.begin(), L2.end(), req,
-                [](const Entry& e, u128 val) { return e.sum < val; });
-
-            while (it != L2.end() && it->sum == req) {
-                Witness w;
-                for (int i = 0; i < n1; ++i) if ((e1.mask >> i) & 1U) w.indices.push_back(i);
-                for (int i = 0; i < n2; ++i) if ((it->mask >> i) & 1U) w.indices.push_back(n1 + i);
-
-                std::string msg;
-                if (verify_witness(inst.elements, inst.target, -1, w, msg)) {
-                    report.solved = true;
-                    report.witness = w;
-                    report.verification_msg = msg;
-                    auto end_time = std::chrono::steady_clock::now();
-                    report.runtime_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-                    report.peak_ram_mb = get_current_peak_ram_mb();
-                    report.threads_used = 1;
-                    return report;
-                }
-                ++it;
-            }
-        }
-
-        auto end_time = std::chrono::steady_clock::now();
-        report.runtime_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-        report.peak_ram_mb = get_current_peak_ram_mb();
-        report.threads_used = 1;
-        return report;
-    }
-}
-
-// ============================================================================
-// ENGINE 2: HGJ With Full Recommendations 1 to 4 (Adaptssp2)
+// ENGINE: HGJ With Full Recommendations 1 to 4
 // Rec 1: Bounded R_mod trial budget per partition
 // Rec 2: Direct Modulo-M1 bucketing / Inverted Index
 // Rec 3: Soft-window relaxation (q_k +/- 1 per quarter)
 // Rec 4: Dual-modulus filtering (M1 + M2=65521) with inverted candidate index
 // ============================================================================
-namespace EngineHGJ2Full {
+namespace EngineHGJ {
+
+    struct FastPrng {
+        u64 state;
+        FastPrng(u64 seed = 13371337ULL) : state(seed ? seed : 0x853c49e6748fea9bULL) {}
+        inline u64 next_u64() {
+            u64 z = (state += 0x9e3779b97f4a7c15ULL);
+            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+            z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+            return z ^ (z >> 31);
+        }
+        inline u32 next_range(u32 limit) {
+            if (limit <= 1) return 0;
+            return (u32)(((u64)(u32)next_u64() * (u64)limit) >> 32);
+        }
+    };
 
     struct BaseListSoA2 {
         std::vector<u32> rem1;
@@ -407,6 +345,13 @@ namespace EngineHGJ2Full {
                                    u32 target_mod1, u32 M1, u32 M2,
                                    u128 lower_bound, u128 upper_bound,
                                    std::vector<HalfEntry2>& out_cand, int q_n) {
+        const u128* const l1_sum = list1.sum.data();
+        const u32*  const l1_mask = list1.mask.data();
+        const u32*  const l1_rem2 = list1.rem2.data();
+        const u128* const l2_sum = list2.sum.data();
+        const u32*  const l2_mask = list2.mask.data();
+        const u32*  const l2_rem2 = list2.rem2.data();
+
         for (u32 r1 : active1) {
             u32 r2 = (target_mod1 >= r1) ? (target_mod1 - r1) : (target_mod1 + M1 - r1);
             u32 c2 = count2[r2];
@@ -414,17 +359,16 @@ namespace EngineHGJ2Full {
             u32 s1 = head1[r1], c1 = count1[r1];
             u32 s2 = head2[r2];
             for (u32 a = 0; a < c1; ++a) {
-                u128 sum1 = list1.sum[s1 + a];
+                u128 sum1 = l1_sum[s1 + a];
                 if (sum1 > upper_bound) continue;
-                u32 m1 = list1.mask[s1 + a];
-                u32 rem2_1 = list1.rem2[s1 + a];
+                u32 m1 = l1_mask[s1 + a];
+                u32 rem2_1 = l1_rem2[s1 + a];
                 for (u32 b = 0; b < c2; ++b) {
-                    u128 half_sum = sum1 + list2.sum[s2 + b];
+                    u128 half_sum = sum1 + l2_sum[s2 + b];
                     if (half_sum < lower_bound || half_sum > upper_bound) continue;
-                    u32 rem2_2 = list2.rem2[s2 + b];
-                    u32 rem2 = rem2_1 + rem2_2;
+                    u32 rem2 = rem2_1 + l2_rem2[s2 + b];
                     if (rem2 >= M2) rem2 -= M2;
-                    out_cand.push_back({half_sum, ((u64)list2.mask[s2 + b] << q_n) | (u64)m1, rem2});
+                    out_cand.push_back({half_sum, ((u64)l2_mask[s2 + b] << q_n) | (u64)m1, rem2});
                 }
             }
         }
@@ -453,13 +397,13 @@ namespace EngineHGJ2Full {
         else if (est_combinations <= 20000) M1 = 16381;
         else M1 = 32749;
 
-        const u32 M2 = 65521; // Secondary coprime modulus (Rec 4)
+        const u32 M2 = 65521;
 
         int radix_bits_total = 1;
         while ((1ULL << radix_bits_total) < M1) radix_bits_total++;
 
         if (verbose) {
-            std::cout << "[ENGINE] Mode: HGJ2 FULL (Rec 1: Bounded Trials, Rec 2: Direct Bucketing,\n"
+            std::cout << "[ENGINE] Mode: HGJ FULL (Rec 1: Bounded Trials, Rec 2: Direct Bucketing,\n"
                       << "                         Rec 3: Soft-Window q_k+/-1, Rec 4: Dual-Modulus M1/M2)\n";
             std::cout << "[INFO] n=" << n << " k=" << k << " q_n=" << q_n << " q_k=" << q_k << "\n";
             std::cout << "[INFO] C(q_n,q_k)=" << est_combinations << "  M1=" << M1 << "  M2=" << M2
@@ -477,12 +421,11 @@ namespace EngineHGJ2Full {
         Witness best_witness;
 
         auto worker = [&](unsigned thread_id) {
-            std::mt19937_64 rng(1337ULL + thread_id * 10007ULL +
+            FastPrng rng(1337ULL + thread_id * 10007ULL +
                 (u64)std::chrono::high_resolution_clock::now().time_since_epoch().count());
             std::vector<int> perm(n);
             for (int i = 0; i < n; ++i) perm[i] = i;
 
-            // 3 weight classes per quarter: 0: q_k-1, 1: q_k, 2: q_k+1
             BaseListSoA2 L1[3], L2[3], R1[3], R2[3];
             for (int w = 0; w < 3; ++w) {
                 L1[w].reserve(est_combinations); L2[w].reserve(est_combinations);
@@ -508,7 +451,6 @@ namespace EngineHGJ2Full {
             size_t est_cand = std::min((size_t)262144, std::max((size_t)4096, (est_combinations * est_combinations * 3) / (size_t)M1 * 2));
             cand_L.reserve(est_cand); cand_R.reserve(est_cand);
 
-            // Dual Modulus Index for cand_R (Rec 4)
             std::vector<int> head_cand_R(M2, -1);
             std::vector<int> next_cand_R;
             next_cand_R.reserve(est_cand);
@@ -528,6 +470,10 @@ namespace EngineHGJ2Full {
                 local_partitions = local_queries = local_base_entries = 0;
             };
 
+            u128 min_L = 0, max_L = 0;
+            int reuse_counter = 0;
+            const int MAX_REUSE = 4;
+
             while (!solution_found.load(std::memory_order_relaxed)) {
                 if (time_limit_s > 0.0) {
                     double el = std::chrono::duration<double>(
@@ -536,20 +482,36 @@ namespace EngineHGJ2Full {
                 }
 
                 local_partitions++;
-                std::shuffle(perm.begin(), perm.end(), rng);
+                bool rebuild_left = (reuse_counter == 0);
+
+                if (rebuild_left) {
+                    for (int i = n - 1; i > 0; --i) {
+                        int j = (int)rng.next_range(i + 1);
+                        std::swap(perm[i], perm[j]);
+                    }
+                    for (int i = 0; i < q_n; ++i) {
+                        Q1[i] = inst.elements[perm[i]];
+                        Q2[i] = inst.elements[perm[q_n + i]];
+                        Left_elem[i] = Q1[i]; Left_elem[q_n + i] = Q2[i];
+                    }
+                } else {
+                    for (int i = n - 1; i > 2 * q_n; --i) {
+                        int j = 2 * q_n + (int)rng.next_range(i - 2 * q_n + 1);
+                        std::swap(perm[i], perm[j]);
+                    }
+                }
 
                 for (int i = 0; i < q_n; ++i) {
-                    Q1[i] = inst.elements[perm[i]];
-                    Q2[i] = inst.elements[perm[q_n + i]];
                     Q3[i] = inst.elements[perm[2 * q_n + i]];
                     Q4[i] = inst.elements[perm[3 * q_n + i]];
-                    Left_elem[i] = Q1[i]; Left_elem[q_n + i] = Q2[i];
                     Right_elem[i] = Q3[i]; Right_elem[q_n + i] = Q4[i];
                 }
 
                 int half_k = 2 * q_k;
-                u128 min_L = sum_smallest_k(Left_elem, half_k);
-                u128 max_L = sum_largest_k(Left_elem, half_k);
+                if (rebuild_left) {
+                    min_L = sum_smallest_k(Left_elem, half_k);
+                    max_L = sum_largest_k(Left_elem, half_k);
+                }
                 u128 min_R = sum_smallest_k(Right_elem, half_k);
                 u128 max_R = sum_largest_k(Right_elem, half_k);
 
@@ -558,9 +520,13 @@ namespace EngineHGJ2Full {
                 u128 lower_bound_R = (inst.target > max_L) ? (inst.target - max_L) : 0;
                 u128 upper_bound_R = (inst.target >= min_L) ? (inst.target - min_L) : 0;
 
+                if (rebuild_left) {
+                    for (int i = 0; i < q_n; ++i) {
+                        Q1r1[i] = (u32)(Q1[i] % (u128)M1); Q1r2[i] = (u32)(Q1[i] % (u128)M2);
+                        Q2r1[i] = (u32)(Q2[i] % (u128)M1); Q2r2[i] = (u32)(Q2[i] % (u128)M2);
+                    }
+                }
                 for (int i = 0; i < q_n; ++i) {
-                    Q1r1[i] = (u32)(Q1[i] % (u128)M1); Q1r2[i] = (u32)(Q1[i] % (u128)M2);
-                    Q2r1[i] = (u32)(Q2[i] % (u128)M1); Q2r2[i] = (u32)(Q2[i] % (u128)M2);
                     Q3r1[i] = (u32)(Q3[i] % (u128)M1); Q3r2[i] = (u32)(Q3[i] % (u128)M2);
                     Q4r1[i] = (u32)(Q4[i] % (u128)M1); Q4r2[i] = (u32)(Q4[i] % (u128)M2);
                 }
@@ -568,33 +534,39 @@ namespace EngineHGJ2Full {
                 int target_weights[3] = {q_k - 1, q_k, q_k + 1};
                 for (int w = 0; w < 3; ++w) {
                     int W = target_weights[w];
-                    L1[w].clear(); L2[w].clear(); R1[w].clear(); R2[w].clear();
-                    gen_combinations_soft(Q1, Q1r1, Q1r2, q_n, W, M1, M2, L1[w]);
-                    gen_combinations_soft(Q2, Q2r1, Q2r2, q_n, W, M1, M2, L2[w]);
+                    if (rebuild_left) {
+                        L1[w].clear(); L2[w].clear();
+                        gen_combinations_soft(Q1, Q1r1, Q1r2, q_n, W, M1, M2, L1[w]);
+                        gen_combinations_soft(Q2, Q2r1, Q2r2, q_n, W, M1, M2, L2[w]);
+                        local_base_entries += (u64)(L1[w].size() + L2[w].size());
+
+                        radix_sort_by_rem1(L1[w], idx_buf, idx_tmp, buf_r1, buf_r2, buf_mask, buf_sum, radix_bits_total);
+                        radix_sort_by_rem1(L2[w], idx_buf, idx_tmp, buf_r1, buf_r2, buf_mask, buf_sum, radix_bits_total);
+
+                        active_L1[w].clear();
+                        for (size_t i = 0; i < L1[w].size(); ++i) {
+                            u32 r = L1[w].rem1[i];
+                            if (count_L1[w][r] == 0) {
+                                head_L1[w][r] = (u32)i;
+                                active_L1[w].push_back(r);
+                            }
+                            count_L1[w][r]++;
+                        }
+                        for (size_t i = 0; i < L2[w].size(); ++i) {
+                            u32 r = L2[w].rem1[i];
+                            if (count_L2[w][r] == 0) head_L2[w][r] = (u32)i;
+                            count_L2[w][r]++;
+                        }
+                    }
+
+                    R1[w].clear(); R2[w].clear();
                     gen_combinations_soft(Q3, Q3r1, Q3r2, q_n, W, M1, M2, R1[w]);
                     gen_combinations_soft(Q4, Q4r1, Q4r2, q_n, W, M1, M2, R2[w]);
-                    local_base_entries += (u64)(L1[w].size() + L2[w].size() + R1[w].size() + R2[w].size());
+                    local_base_entries += (u64)(R1[w].size() + R2[w].size());
 
-                    radix_sort_by_rem1(L1[w], idx_buf, idx_tmp, buf_r1, buf_r2, buf_mask, buf_sum, radix_bits_total);
-                    radix_sort_by_rem1(L2[w], idx_buf, idx_tmp, buf_r1, buf_r2, buf_mask, buf_sum, radix_bits_total);
                     radix_sort_by_rem1(R1[w], idx_buf, idx_tmp, buf_r1, buf_r2, buf_mask, buf_sum, radix_bits_total);
                     radix_sort_by_rem1(R2[w], idx_buf, idx_tmp, buf_r1, buf_r2, buf_mask, buf_sum, radix_bits_total);
 
-                    // Direct M1 Bucketing (Rec 2)
-                    active_L1[w].clear();
-                    for (size_t i = 0; i < L1[w].size(); ++i) {
-                        u32 r = L1[w].rem1[i];
-                        if (count_L1[w][r] == 0) {
-                            head_L1[w][r] = (u32)i;
-                            active_L1[w].push_back(r);
-                        }
-                        count_L1[w][r]++;
-                    }
-                    for (size_t i = 0; i < L2[w].size(); ++i) {
-                        u32 r = L2[w].rem1[i];
-                        if (count_L2[w][r] == 0) head_L2[w][r] = (u32)i;
-                        count_L2[w][r]++;
-                    }
                     active_R1[w].clear();
                     for (size_t i = 0; i < R1[w].size(); ++i) {
                         u32 r = R1[w].rem1[i];
@@ -614,9 +586,8 @@ namespace EngineHGJ2Full {
                 u32 target_mod1 = (u32)(inst.target % (u128)M1);
                 u32 target_mod2 = (u32)(inst.target % (u128)M2);
 
-                // Bounded Trials (Rec 1)
                 u32 max_trials = (M1 <= 2048) ? M1 : std::min(M1, (u32)2048);
-                u32 r_start = (u32)(rng() % M1);
+                u32 r_start = (u32)rng.next_range(M1);
                 u32 r_step = 997 % M1; if (r_step == 0) r_step = 1;
 
                 for (u32 trial = 0; trial < max_trials && !solution_found; ++trial) {
@@ -627,7 +598,6 @@ namespace EngineHGJ2Full {
                         : (M1 - (R_mod - target_mod1));
 
                     cand_L.clear();
-                    // Merge 3 soft pairs: (1,1), (0,2), (2,0)
                     merge_quarter_pair(L1[1], L2[1], active_L1[1], head_L1[1], count_L1[1], head_L2[1], count_L2[1],
                                        R_mod, M1, M2, lower_bound_L, upper_bound_L, cand_L, q_n);
                     if (L1[0].size() > 0 && L2[2].size() > 0) {
@@ -655,7 +625,6 @@ namespace EngineHGJ2Full {
                     total_half_candidates.fetch_add((u64)cand_R.size(), std::memory_order_relaxed);
                     if (solution_found.load(std::memory_order_relaxed) || cand_R.empty()) continue;
 
-                    // Dual-Modulus Index on cand_R (Rec 4: Direct O(1) matching without sorting)
                     if (next_cand_R.size() < cand_R.size()) next_cand_R.resize(cand_R.size() + 4096);
                     active_cand_R.clear();
                     for (size_t i = 0; i < cand_R.size(); ++i) {
@@ -667,12 +636,17 @@ namespace EngineHGJ2Full {
                         head_cand_R[r2] = (int)i;
                     }
 
+                    u64 target_u64 = (u64)inst.target;
                     for (const auto& cL : cand_L) {
                         if (solution_found.load(std::memory_order_relaxed)) break;
                         if (cL.sum > inst.target) continue;
                         u32 req_r2 = (target_mod2 >= cL.rem2) ? (target_mod2 - cL.rem2) : (target_mod2 + M2 - cL.rem2);
+                        u64 cL_sum_u64 = (u64)cL.sum;
+                        int cL_pop = __builtin_popcountll(cL.mask_half);
 
                         for (int idx = head_cand_R[req_r2]; idx != -1; idx = next_cand_R[idx]) {
+                            if ((cL_sum_u64 + (u64)cand_R[idx].sum) != target_u64) continue;
+                            if (cL_pop + __builtin_popcountll(cand_R[idx].mask_half) != k) continue;
                             if (cL.sum + cand_R[idx].sum != inst.target) continue;
 
                             Witness cand;
@@ -711,7 +685,6 @@ namespace EngineHGJ2Full {
                                 report.verification_msg = msg;
                                 cv_done.notify_all();
                             }
-                            // Clean up head_cand_R before return
                             for (u32 r : active_cand_R) head_cand_R[r] = -1;
                             active_cand_R.clear();
                             flush_counters();
@@ -719,17 +692,21 @@ namespace EngineHGJ2Full {
                         }
                     }
 
-                    // Reset head_cand_R
                     for (u32 r : active_cand_R) head_cand_R[r] = -1;
                     active_cand_R.clear();
                 }
 
-                // Clean up count tables in O(C)
                 for (int w = 0; w < 3; ++w) {
-                    for (u32 r : active_L1[w]) count_L1[w][r] = 0;
-                    for (size_t i = 0; i < L2[w].size(); ++i) count_L2[w][L2[w].rem1[i]] = 0;
                     for (u32 r : active_R1[w]) count_R1[w][r] = 0;
                     for (size_t i = 0; i < R2[w].size(); ++i) count_R2[w][R2[w].rem1[i]] = 0;
+                }
+                reuse_counter++;
+                if (reuse_counter == MAX_REUSE) {
+                    for (int w = 0; w < 3; ++w) {
+                        for (u32 r : active_L1[w]) count_L1[w][r] = 0;
+                        for (size_t i = 0; i < L2[w].size(); ++i) count_L2[w][L2[w].rem1[i]] = 0;
+                    }
+                    reuse_counter = 0;
                 }
 
                 flush_counters();
@@ -759,7 +736,7 @@ namespace EngineHGJ2Full {
                 double rate = (elapsed > 0) ? ((double)p / elapsed) : 0.0;
                 double fp_rate = (p > 0) ? ((double)fp / (double)p * 100.0) : 0.0;
 
-                double p_hit = 1.0 / 10.0; // Rec 3 soft-window partition probability
+                double p_hit = 1.0 / 10.0;
                 double est_needed = (p_hit > 0.0) ? (std::log(0.05) / std::log(1.0 - p_hit)) : 0.0;
                 double rem_part = std::max(0.0, est_needed - (double)p);
                 double eta_s = (rate > 0.0) ? (rem_part / rate) : 0.0;
@@ -797,13 +774,8 @@ namespace EngineHGJ2Full {
 struct Solver {
     static Report solve(const Instance& inst, unsigned num_threads, double time_limit_s,
                         bool proof_mode, bool verbose) {
-        int n = (int)inst.elements.size();
-        if (n <= 44) {
-            if (verbose) std::cout << "[ENGINE] Mode: Exact MITM (EngineSmall, fast for N <= 44)\n";
-            return EngineSmall::solve(inst, num_threads, time_limit_s);
-        } else {
-            return EngineHGJ2Full::solve(inst, num_threads, time_limit_s, proof_mode, verbose);
-        }
+        if (verbose) std::cout << "[ENGINE] Mode: HGJ Full (EngineHGJ, all N)\n";
+        return EngineHGJ::solve(inst, num_threads, time_limit_s, proof_mode, verbose);
     }
 };
 
@@ -841,7 +813,7 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "================================================================================\n";
-    std::cout << " HGJ2 ADAPTIVE SOLVER (FULL RECOMMENDATIONS 1 - 4)\n";
+    std::cout << " HGJ FULL SOLVER (EngineHGJ - ALL N)\n";
     std::cout << "================================================================================\n";
     std::cout << "N elemen        : " << inst.elements.size() << "\n";
     std::cout << "Target          : " << inst.target << "\n";
@@ -857,7 +829,7 @@ int main(int argc, char* argv[]) {
     if (calibrate_s > 0) {
         std::cout << "--------------------------------------------------------------------------------\n";
         std::cout << "[CALIBRATION] " << std::fixed << std::setprecision(1) << calibrate_s
-                  << " detik, memakai pipeline HGJ2 yang sama.\n";
+                  << " detik, memakai pipeline HGJ yang sama.\n";
         Report cal = Solver::solve(inst, num_threads, calibrate_s, false, false);
         if (cal.solved) {
             std::cout << "[CALIBRATION] SOLVED sebelum long-run.\n";
