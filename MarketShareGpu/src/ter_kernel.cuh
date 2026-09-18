@@ -3,7 +3,6 @@
 #include <vector>
 
 #ifdef WITH_GPU
-// Runs Level 1 merge on GPU (Tesla T4 sm_75 / CUDA)
 bool run_level1_merge_gpu(
     const std::vector<TerEntry>& A,
     const std::vector<TerEntry>& B,

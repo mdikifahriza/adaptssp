@@ -15,7 +15,6 @@ public:
 
     int64_t n_bytes_alloc{};
 
-    /* Required data for any computations on GPU. Is considered constant throughout the algorithm. */
     size_t *set1_scores{};
     size_t *set2_scores{};
     size_t *set3_scores{};
@@ -27,18 +26,20 @@ public:
     size_t m_rows{};
     size_t n_cols{};
 
-    /* GPU buffers. Get resized depending on the problem. */
     size_t *required_buffer{};
-    size_t len_required_buffer{}; /* Size of above buffers. */
+    size_t len_required_buffer{};
     size_t n_required;
+
+    size_t *required_idx_buffer{};
+    size_t len_required_idx_buffer{};
 
     size_t *search_buffer{};
     size_t len_search_buffer{};
+    
     bool *results_search_buffer{};
     size_t len_results_buffer{};
     size_t n_search{};
 
-    /* For new tuples approach. */
     size_t *tuples_buffer{};
     size_t len_tuples_buffer{};
     size_t n_tuples{};
@@ -57,6 +58,9 @@ public:
 };
 
 void sort_required_gpu(GpuData &gpu_data);
+
+std::vector<std::pair<size_t, size_t>> find_matching_pairs_gpu(GpuData &gpu_data);
+
 std::vector<size_t> find_equal_hashes(GpuData &gpu_data, bool sort_required = true);
 std::vector<std::pair<size_t, size_t>> find_hash_positions_gpu(GpuData &gpu_data, const std::vector<size_t>& hashes, size_t n_p1, size_t n_p2, bool encode_first_as_required = false);
 

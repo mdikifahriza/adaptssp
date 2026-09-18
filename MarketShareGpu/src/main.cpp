@@ -9,9 +9,10 @@
 #include <bitset>
 #include <cassert>
 #include <chrono>
-#include <climits> // For CHAR_BIT
+#include <climits>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cctype>
 #include <execution>
 #include <fstream>
@@ -30,17 +31,49 @@
 
 #include <omp.h>
 
-/* [OPT] SSE4.2: _mm_popcnt_u64, SSE2: _mm_add_epi64 / _mm_loadu_si128 */
-#include <nmmintrin.h>  /* SSE4.2 — _mm_popcnt_u64 */
-#include <emmintrin.h>  /* SSE2   — _mm_add_epi64, _mm_loadu/storeu_si128 */
+#include <nmmintrin.h>
+#include <emmintrin.h>
+
+#if defined(USE_PARALLEL_SORT)
+#define PSORT(first, last, comp) std::sort(std::execution::par, (first), (last), (comp))
+#else
+#define PSORT(first, last, comp) std::sort((first), (last), (comp))
+#endif
 
 #ifdef WITH_GPU
 #include "cuda_kernels.cuh"
 #endif
 
-/* 3000000000 ~= 56 GB of active storage requirement. 4000000000 goes OOM on H200. 3500000000 works and goes up to 63.6 GB. 3900000000 also works and is about ~= 70.11 */
-/* Adapted for 8GB RAM (Intel Celeron N5100). Safe limit for CPU memory. */
 size_t max_pairs_per_chunk = 20000000;
+
+constexpr size_t BYTES_PER_PAIR_HOST_ESTIMATE = 64;
+
+size_t compute_default_max_pairs(size_t budget_bytes, double headroom_fraction = 0.6)
+{
+    const size_t usable_bytes = static_cast<size_t>(budget_bytes * headroom_fraction);
+    size_t max_pairs = usable_bytes / BYTES_PER_PAIR_HOST_ESTIMATE;
+    if (max_pairs < 1000)
+        max_pairs = 1000;
+    return max_pairs;
+}
+
+size_t detect_system_ram_bytes()
+{
+    std::ifstream meminfo("/proc/meminfo");
+    if (meminfo.is_open())
+    {
+        std::string label;
+        size_t kb;
+        std::string unit;
+        while (meminfo >> label >> kb >> unit)
+        {
+            if (label == "MemTotal:")
+                return kb * 1024ULL;
+        }
+    }
+    constexpr size_t fallback_bytes = 8ULL * 1024 * 1024 * 1024;
+    return fallback_bytes;
+}
 
 typedef std::chrono::high_resolution_clock::time_point TimeVar;
 using u128 = unsigned __int128;
@@ -277,7 +310,7 @@ void write_1d_prb(const SubsetSum1D128 &instance, const std::string &path)
 size_t highestSetBit(size_t value)
 {
     if (value == 0)
-        return -1; // No bits are set
+        return -1;
 #if defined(__SIZEOF_SIZE_T__) && __SIZEOF_SIZE_T__ == 8
     return (sizeof(size_t) * CHAR_BIT - 1) - __builtin_clzll(value);
 #elif defined(__SIZEOF_SIZE_T__) && __SIZEOF_SIZE_T__ == 4
@@ -296,11 +329,10 @@ void print_bits(size_t value)
 {
     if (value == 0)
     {
-        std::cout << "0"; // Special case: value is 0
+        std::cout << "0";
         return;
     }
 
-    // Determine the position of the highest set bit
     size_t msb = 0;
     for (size_t i = sizeof(size_t) * 8; i > 0; --i)
     {
@@ -311,7 +343,6 @@ void print_bits(size_t value)
         }
     }
 
-    // Print bits from the highest set bit down to 0
     for (size_t i = msb + 1; i > 0; --i)
     {
         std::cout << ((value & (1ULL << (i - 1))) ? '1' : '0');
@@ -334,7 +365,7 @@ template <typename T>
 std::vector<T> generate_subsets(const std::vector<T> &weights)
 {
     size_t n = weights.size();
-    size_t total_subsets = 1ULL << n; /* Total subsets is 2^n. */
+    size_t total_subsets = 1ULL << n;
 
     printf("Generating %zu possible subset weights for set of size %zu.\n", total_subsets, n);
     std::vector<T> set_weights(total_subsets, 0);
@@ -344,14 +375,11 @@ std::vector<T> generate_subsets(const std::vector<T> &weights)
     {
         const T weight = weights[pass];
 
-        /* [OPT] SSE2 _mm_add_epi64: proses 2 elemen uint64_t per iterasi SIMD.
-         * Untuk n/4=16: loop ini dijalankan 16 kali dengan generated hingga 32768.
-         * u128 tidak bisa pakai SSE karena lebar 128-bit melebihi register. */
         if constexpr (std::is_same_v<T, uint64_t>)
         {
             const __m128i wvec = _mm_set1_epi64x(static_cast<int64_t>(weight));
             size_t i = 0;
-            /* Loop SIMD: 2 elemen per iterasi */
+            
             for (; i + 2 <= generated; i += 2)
             {
                 __m128i v = _mm_loadu_si128(
@@ -360,16 +388,33 @@ std::vector<T> generate_subsets(const std::vector<T> &weights)
                     reinterpret_cast<__m128i*>(set_weights.data() + generated + i),
                     _mm_add_epi64(v, wvec));
             }
-            /* Tail: sisa 0 atau 1 elemen */
+            
             for (; i < generated; ++i)
                 set_weights[generated + i] = set_weights[i] + weight;
         }
         else
         {
-            /* u128 atau tipe lain: pakai OMP paralel scalar */
+            
+            if (generated >= 4096)
+            {
 #pragma omp parallel for
-            for (size_t i = 0; i < generated; ++i)
-                set_weights[generated + i] = set_weights[i] + weight;
+                for (size_t i = 0; i < generated; ++i)
+                    set_weights[generated + i] = set_weights[i] + weight;
+            }
+            else
+            {
+                
+                size_t i = 0;
+                for (; i + 4 <= generated; i += 4)
+                {
+                    set_weights[generated + i]     = set_weights[i]     + weight;
+                    set_weights[generated + i + 1] = set_weights[i + 1] + weight;
+                    set_weights[generated + i + 2] = set_weights[i + 2] + weight;
+                    set_weights[generated + i + 3] = set_weights[i + 3] + weight;
+                }
+                for (; i < generated; ++i)
+                    set_weights[generated + i] = set_weights[i] + weight;
+            }
         }
 
         generated <<= 1;
@@ -378,17 +423,14 @@ std::vector<T> generate_subsets(const std::vector<T> &weights)
     return set_weights;
 }
 
-// Function to sort an array and obtain sorted indices
 template <typename T>
 std::vector<size_t> sort_indices(const std::vector<T> &arr, bool ascending)
 {
     size_t n = arr.size();
 
-    // Create indices list from 0 to n-1 using std::iota
     std::vector<size_t> indices(n);
     std::iota(indices.begin(), indices.end(), 0);
 
-    // Sort indices based on corresponding values in the array
     if (ascending)
     {
         std::sort(indices.begin(), indices.end(), [&arr](size_t i1, size_t i2)
@@ -415,7 +457,6 @@ static inline std::vector<size_t> unpack_mask(size_t mask)
     return indices;
 }
 
-/* [OPT] Variant yang menulis ke buffer yang sudah ada (hindari alokasi heap di hot path). */
 static inline void unpack_mask_into(size_t mask, std::vector<size_t> &buf)
 {
     buf.clear();
@@ -434,7 +475,7 @@ size_t print_subset_and_compute_sum(const std::vector<size_t> &numbers, size_t i
     bool hasElements = false;
     for (size_t i = 0; i < numbers.size(); ++i)
     {
-        // Check if the i-th bit in the index is set
+        
         if (index & (1ULL << i))
         {
             if (hasElements)
@@ -513,7 +554,7 @@ void append_solution_to_file(std::ofstream &sol_file, const std::vector<size_t> 
 {
     for (size_t i = 0; i < numbers.size(); ++i)
     {
-        // Check if the i-th bit in the index is set
+        
         if (index & (1ULL << i))
             sol_file << 1;
         else
@@ -545,13 +586,19 @@ size_t custom_hash_cpu(size_t x)
     return x;
 }
 
+struct HashIdx
+{
+    size_t hash;
+    size_t idx;
+};
+
 template <const bool ENCODE_REQUIRED>
-std::vector<size_t> flatten_and_encode_tuples_cpu(const std::vector<PairsTuple>& tuples, size_t n_tuples, const std::vector<size_t> &scores1, const std::vector<size_t> &scores2, const MarkShareFeas &ms_inst, size_t row_offset)
+std::vector<HashIdx> flatten_and_encode_tuples_cpu_kv(const std::vector<PairsTuple>& tuples, size_t n_tuples, const std::vector<size_t> &scores1, const std::vector<size_t> &scores2, const MarkShareFeas &ms_inst, size_t row_offset)
 {
     const size_t m_rows_left = ms_inst.m() - row_offset;
-    std::vector<size_t> hashes (n_tuples);
+    std::vector<HashIdx> out(n_tuples);
 
-#pragma omp parallel for
+#pragma omp parallel for schedule(dynamic, 64)
     for (size_t i_tuple = 0; i_tuple < tuples.size(); ++i_tuple)
     {
         auto first = tuples[i_tuple].pairs_first;
@@ -563,9 +610,8 @@ std::vector<size_t> flatten_and_encode_tuples_cpu(const std::vector<PairsTuple>&
         {
             size_t key = 0;
 
-            /* Compute the hash of this tuple. */
             for (size_t i_row = 0; i_row < m_rows_left; ++i_row) {
-                /* Compute the pair's score of this row and add it (encoded) to key. */
+                
                 size_t row_score = scores1[first * m_rows_left + i_row] + scores2[second * m_rows_left + i_row];
 
                 if (ENCODE_REQUIRED)
@@ -574,12 +620,12 @@ std::vector<size_t> flatten_and_encode_tuples_cpu(const std::vector<PairsTuple>&
                 key ^= custom_hash_cpu(row_score) + 0x9e3779b9 + (key << 6) + (key >> 2);
             }
 
-            hashes[pair_offset] = key;
+            out[pair_offset] = {key, pair_offset};
             ++pair_offset;
         }
     }
 
-    return hashes;
+    return out;
 }
 
 void compute_scores_cpu(const MarkShareFeas &ms_inst, std::vector<size_t> &scores, const std::vector<size_t> &subsets, size_t col_offset, size_t row_offset)
@@ -587,8 +633,7 @@ void compute_scores_cpu(const MarkShareFeas &ms_inst, std::vector<size_t> &score
     const size_t m_rows_left = ms_inst.m() - row_offset;
     assert(ms_inst.m() >= row_offset);
 
-    /* [OPT] Gunakan thread_local buffer untuk hindari alokasi heap berulang di inner loop. */
-#pragma omp parallel for
+#pragma omp parallel for schedule(dynamic, 256)
     for (size_t i = 0; i < subsets.size(); ++i)
     {
         thread_local std::vector<size_t> local_indices;
@@ -597,12 +642,11 @@ void compute_scores_cpu(const MarkShareFeas &ms_inst, std::vector<size_t> &score
     }
 }
 
-/* For each tuple consisting of one element in set1_scores and a range of elements in set2_scores, compute its partial right hand side. */
 void combine_scores_cpu(const std::vector<size_t> &set1_scores, const std::vector<size_t> &set2_scores, size_t m_rows, const std::vector<PairsTuple> &tuples, std::vector<size_t> &scores_pairs, size_t row_offset)
 {
     const size_t m_rows_left = m_rows - row_offset;
 
-#pragma omp parallel for
+#pragma omp parallel for schedule(dynamic, 64)
     for (size_t i_tuple = 0; i_tuple < tuples.size(); ++i_tuple)
     {
         auto first = tuples[i_tuple].pairs_first;
@@ -662,8 +706,7 @@ void print_info_line(
 
 bool verify_solution(const std::pair<size_t, size_t> &solution, const PairsTuple *same_score_q1, size_t n_tuples_q1, const PairsTuple *same_score_q2, size_t n_tuples_q2, const std::vector<size_t> &set1_subsets, const std::vector<size_t> &set2_subsets_sorted_asc, const std::vector<size_t> &set3_subsets, const std::vector<size_t> &set4_subsets_sorted_desc, const std::vector<size_t> &subset_sum_1d, const std::vector<size_t> &offsets, const MarkShareFeas &ms_inst)
 {
-    /* Print and verify the solution! */
-    /* Get the correct pairs. */
+    
     size_t pos_q1 = 0;
     size_t pos_q2 = 0;
     (void)n_tuples_q1;
@@ -699,7 +742,6 @@ bool verify_solution(const std::pair<size_t, size_t> &solution, const PairsTuple
     size_t len;
     concat_vectors(solution_1d, len, vectors, offsets);
 
-    /* We found a solution. Construct it, print it, and return. */
     if (!ms_inst.is_solution_feasible(solution_1d, len))
     {
 #ifndef NDEBUG
@@ -719,35 +761,29 @@ std::pair<size_t, T> max_encodable_dimension(size_t max_coeff, size_t n_cols)
     static_assert(std::numeric_limits<T>::max() >= std::numeric_limits<size_t>::max());
     assert(max_coeff > 1);
 
-    /* TODO: we need to properly check for an overflow here. */
     const T basis = static_cast<T>(n_cols) * static_cast<T>(max_coeff) + 1;
 
-    /* Given a vector (x1, x2, .. ) we reduce dimensions as x1 * max_sum^0 + x2 * max_sum^1 + x3 * max_sum^2 ...
-     * When encoding into T we need to guarantee that the highest dimension, d, still fits into our index type. Define the basis B as
-     *   B := (max_sum + 1)
-     * Then
-     *   sum_0^d-1 (B - 1) (max_sum + 1)^k <= max_index
-     * <=> geometric sum
-     *   (B - 1) [B^d - 1] / [B - 1] = (B - 1) * [B^d - 1] / (B - 1) <= max_index
-     * <=>
-     *   B^d <= max_index + 1
-     * <=>
-     *   d_max = |_ log_(max_sum + 1) (max_index + 1) _|
-     */
     size_t max_dim = static_cast<size_t>(std::floor(std::log(max_index) / std::log(basis)));
 
     printf("Max reducible dimension is %zu (encoded with basis %zu)\n", max_dim, static_cast<size_t>(basis));
     return {max_dim, basis};
 }
 
-template <bool ascending, typename T, typename F>
-void extract_pairs_from_heap(std::vector<PairsTuple> &pairs_same_score, std::vector<std::pair<size_t, size_t>> &heap, size_t score_pair, std::vector<size_t> &chunks_beg, std::vector<size_t> &chunks_n_pairs, size_t &n_pairs_total, const std::vector<T> &first_weights, const std::vector<T> &second_weights, const std::vector<T> &second_weights_sorted_asc, F &&cmp)
+template <typename T>
+struct HeapNode
 {
-    /* Counter for pairs stored in current chunk. */
+    T score;
+    size_t first;
+    size_t second;
+};
+
+template <bool ascending, typename T, typename F>
+void extract_pairs_from_heap(std::vector<PairsTuple> &pairs_same_score, std::vector<HeapNode<T>> &heap, T score_pair, std::vector<size_t> &chunks_beg, std::vector<size_t> &chunks_n_pairs, size_t &n_pairs_total, const std::vector<T> &first_weights, const std::vector<T> &second_weights, const std::vector<T> &second_weights_sorted_asc, F &&cmp)
+{
+    
     size_t n_pairs_chunk = 0;
 
-    /* For each element a in the heap with score(a) == score_pair, collect all solutions. */
-    while (!heap.empty() && first_weights[heap.front().first] + second_weights_sorted_asc[heap.front().second] == score_pair)
+    while (!heap.empty() && heap.front().score == score_pair)
     {
         const auto pair1_same_score = heap.front();
         std::pop_heap(heap.begin(), heap.end(), cmp);
@@ -756,7 +792,6 @@ void extract_pairs_from_heap(std::vector<PairsTuple> &pairs_same_score, std::vec
         const size_t pos_second_weights_beg = pair1_same_score.second;
         size_t pos_second_weights_end = pos_second_weights_beg;
 
-        /* Iterate the second elements. */
         const auto pos2_val = second_weights_sorted_asc[pos_second_weights_end];
 
         while (pos_second_weights_end < second_weights.size() && pos2_val == second_weights_sorted_asc[pos_second_weights_end])
@@ -778,12 +813,13 @@ void extract_pairs_from_heap(std::vector<PairsTuple> &pairs_same_score, std::vec
 
         if (pos_second_weights_end < second_weights.size())
         {
+            const T next_score = first_weights[pair1_same_score.first] + second_weights_sorted_asc[pos_second_weights_end];
             if (ascending)
-                assert(score_pair < first_weights[pair1_same_score.first] + second_weights_sorted_asc[pos_second_weights_end]);
+                assert(score_pair < next_score);
             else
-                assert(score_pair > first_weights[pair1_same_score.first] + second_weights_sorted_asc[pos_second_weights_end]);
+                assert(score_pair > next_score);
 
-            heap.emplace_back(pair1_same_score.first, pos_second_weights_end);
+            heap.push_back({next_score, pair1_same_score.first, pos_second_weights_end});
             std::push_heap(heap.begin(), heap.end(), cmp);
         }
     }
@@ -791,102 +827,62 @@ void extract_pairs_from_heap(std::vector<PairsTuple> &pairs_same_score, std::vec
     chunks_beg.push_back(pairs_same_score.size());
 }
 
-std::vector<size_t> find_equal_hashes_cpu(std::vector<size_t>& hashes_required, const std::vector<size_t>& hashes_search, bool sort_required = true)
+std::vector<std::pair<size_t, size_t>> find_matching_pairs_cpu(
+    std::vector<HashIdx>& required,
+    std::vector<HashIdx>& search)
 {
-    /* The shorter array will be encoded as required and will be sorted. */
-    const size_t n_search = hashes_search.size();
-
-    /* Compute hashes of required vectors. */
     auto profiler = std::make_unique<ScopedProfiler>("Eval CPU: sort required     ");
-    if (sort_required)
+    PSORT(required.begin(), required.end(),
+          [](const HashIdx &a, const HashIdx &b) { return a.hash < b.hash; });
+
+    profiler = std::make_unique<ScopedProfiler>("Eval CPU: sort search       ");
+    PSORT(search.begin(), search.end(),
+          [](const HashIdx &a, const HashIdx &b) { return a.hash < b.hash; });
+
+    profiler = std::make_unique<ScopedProfiler>("Eval CPU: merge join        ");
+
+    std::vector<std::pair<size_t, size_t>> candidates;
+    size_t i = 0, j = 0;
+    while (i < required.size() && j < search.size())
     {
-        std::sort(hashes_required.begin(), hashes_required.end());
-    }
+        if (required[i].hash < search[j].hash) { ++i; continue; }
+        if (required[i].hash > search[j].hash) { ++j; continue; }
 
-    profiler = std::make_unique<ScopedProfiler>("Eval CPU: binary search     ");
+        size_t i_end = i;
+        while (i_end < required.size() && required[i_end].hash == required[i].hash) ++i_end;
+        size_t j_end = j;
+        while (j_end < search.size() && search[j_end].hash == search[j].hash) ++j_end;
 
-    std::vector<bool> result(n_search);
+        for (size_t a = i; a < i_end; ++a)
+            for (size_t b = j; b < j_end; ++b)
+                candidates.emplace_back(required[a].idx, search[b].idx);
 
-    /* Parallel binary search for each hash. */
-#pragma omp parallel for
-    for (size_t i = 0; i < n_search; i++)
-    {
-        result[i] = std::binary_search(hashes_required.begin(), hashes_required.end(), hashes_search[i]);
-    }
-
-    profiler = std::make_unique<ScopedProfiler>("Eval CPU: check results     ");
-
-    std::vector<size_t> hashes;
-    for (size_t i = 0; i < n_search; i++)
-    {
-        if (result[i])
-        {
-            hashes.push_back(hashes_search[i]);
-        }
+        i = i_end;
+        j = j_end;
     }
 
     profiler.reset();
-    return hashes;
-}
-
-std::vector<std::pair<size_t, size_t>> find_hash_positions_cpu(const std::vector<size_t>& hashes_required,
-                                                                const std::vector<size_t>& hashes_search,
-                                                                const std::vector<size_t>& matching_hashes,
-                                                                bool encode_first_as_required)
-{
-    encode_first_as_required = encode_first_as_required || (hashes_required.size() < hashes_search.size());
-
-    std::vector<std::pair<size_t, size_t>> solution_candidates;
-    solution_candidates.reserve(matching_hashes.size());
-
-    for (const auto hash : matching_hashes)
-    {
-        // Find position in required vector
-        auto iter_req = std::find(hashes_required.begin(), hashes_required.end(), hash);
-        // Find position in search vector
-        auto iter_search = std::find(hashes_search.begin(), hashes_search.end(), hash);
-
-        // Assertions (could be removed or replaced with error handling)
-        assert(iter_req != hashes_required.end());
-        assert(iter_search != hashes_search.end());
-
-        auto pos_req = std::distance(hashes_required.begin(), iter_req);
-        auto pos_search = std::distance(hashes_search.begin(), iter_search);
-
-        if (encode_first_as_required)
-            solution_candidates.emplace_back(pos_req, pos_search);
-        else
-            solution_candidates.emplace_back(pos_search, pos_req);
-    }
-
-    return solution_candidates;
+    return candidates;
 }
 
 std::pair<bool, std::pair<size_t, size_t>> evaluate_cpu(const std::vector<size_t> &set1_scores, const std::vector<size_t> &set2_scores_sorted_asc, const std::vector<size_t> &set3_scores, const std::vector<size_t> &set4_scores_sorted_desc, const std::vector<PairsTuple> &same_score_q1, size_t n_pairs_q1, const std::vector<PairsTuple> &same_score_q2, size_t n_pairs_q2, const MarkShareFeas &ms_inst, size_t reduce_dim, const std::vector<size_t> &set1_subsets, const std::vector<size_t> &set2_subsets_sorted_asc, const std::vector<size_t> &set3_subsets, const std::vector<size_t> &set4_subsets_sorted_desc,
                                                                          const std::vector<size_t> &subset_sum_1d, const std::vector<size_t> &offsets)
 {
-    /* Encode the 2 sets as 'required'. */
+    
     auto profiler = std::make_unique<ScopedProfiler>("Eval CPU: combine + encode  ");
-    auto required = flatten_and_encode_tuples_cpu<true>(same_score_q1, n_pairs_q1, set1_scores, set2_scores_sorted_asc, ms_inst, reduce_dim);
-    const auto search = flatten_and_encode_tuples_cpu<false>(same_score_q2, n_pairs_q2, set3_scores, set4_scores_sorted_desc, ms_inst, reduce_dim);
+    auto required = flatten_and_encode_tuples_cpu_kv<true>(same_score_q1, n_pairs_q1, set1_scores, set2_scores_sorted_asc, ms_inst, reduce_dim);
+    auto search = flatten_and_encode_tuples_cpu_kv<false>(same_score_q2, n_pairs_q2, set3_scores, set4_scores_sorted_desc, ms_inst, reduce_dim);
     profiler.reset();
 
-    auto hashes = find_equal_hashes_cpu(required, search);
+    const auto candidates = find_matching_pairs_cpu(required, search);
 
-    if (!hashes.empty())
+    for (const auto &solution_cand : candidates)
     {
-        required = flatten_and_encode_tuples_cpu<true>(same_score_q1, n_pairs_q1, set1_scores, set2_scores_sorted_asc, ms_inst, reduce_dim);
-        const std::vector<std::pair<size_t, size_t>> candidates = find_hash_positions_cpu(required, search, hashes, true);
+        
+        const auto feasible = verify_solution(solution_cand, same_score_q1.data(), n_pairs_q1, same_score_q2.data(), n_pairs_q2, set1_subsets, set2_subsets_sorted_asc, set3_subsets, set4_subsets_sorted_desc, subset_sum_1d, offsets, ms_inst);
 
-        /* Check all potential solutions. */
-        for (const auto &solution_cand : candidates)
-        {
-            /* Offset each solution candidate by its chunk. */
-            const auto feasible = verify_solution(solution_cand, same_score_q1.data(), n_pairs_q1, same_score_q2.data(), n_pairs_q2, set1_subsets, set2_subsets_sorted_asc, set3_subsets, set4_subsets_sorted_desc, subset_sum_1d, offsets, ms_inst);
-
-            if (feasible)
-                return {true, solution_cand};
-        }
+        if (feasible)
+            return {true, solution_cand};
     }
 
     return {false, {0, 0}};
@@ -906,7 +902,6 @@ std::tuple<bool, size_t, size_t, std::pair<size_t, size_t>> evaluate_gpu(GpuData
     assert(chunks_q1_beg.size() == n_q1_chunks + 1);
     assert(chunks_q2_beg.size() == n_q2_chunks + 1);
 
-    /* Do all this per chunk and quadratically. */
     size_t n_q1_pairs_offset = 0;
 
     for (size_t i_q1_chunk = 0; i_q1_chunk < n_q1_chunks; ++i_q1_chunk)
@@ -933,20 +928,12 @@ std::tuple<bool, size_t, size_t, std::pair<size_t, size_t>> evaluate_gpu(GpuData
 
             combine_and_encode_tuples_search_gpu(gpu_data, q2_chunk, n_tuples_q2_chunk, n_pairs_q2_chunk, gpu_data.set3_scores, gpu_data.set4_scores, reduce_dim);
 
-            const std::vector<size_t> hashes = find_equal_hashes(gpu_data, false);
+            const auto candidates = find_matching_pairs_gpu(gpu_data);
 
-            if (!hashes.empty())
+            if (!candidates.empty())
             {
-                /* Retrieve the actual solution. We have to copy encode our arrays once more and look for the hash afterwards. */
-                combine_and_encode_tuples_required_gpu(gpu_data, q1_chunk, n_tuples_q1_chunk, n_pairs_q1_chunk, gpu_data.set1_scores, gpu_data.set2_scores, reduce_dim);
-                combine_and_encode_tuples_search_gpu(gpu_data, q2_chunk, n_tuples_q2_chunk, n_pairs_q2_chunk, gpu_data.set3_scores, gpu_data.set4_scores, reduce_dim);
-
-                const std::vector<std::pair<size_t, size_t>> candidates = find_hash_positions_gpu(gpu_data, hashes, n_pairs_q1_chunk, n_pairs_q2_chunk, true);
-
-                /* Check all potential solutions. */
                 for (const auto &solution_cand : candidates)
                 {
-                    /* Offset each solution candidate by its chunk. */
                     const auto feasible = verify_solution(solution_cand, q1_chunk, n_tuples_q1_chunk, q2_chunk, n_tuples_q2_chunk, set1_subsets, set2_subsets_sorted_asc, set3_subsets, set4_subsets_sorted_desc, subset_sum_1d, offsets, ms_inst);
 
                     if (feasible)
@@ -1071,7 +1058,6 @@ bool print_and_verify_solution(const PipelineBuffer &buf, const EvalResult &res,
     (void)asc_indices_set2_weights;
     (void)desc_indices_set4_weights;
 
-    /* Get the correct pairs. */
     size_t pos_q1 = buf.chunks_q1_beg[res.i_q1_chunk];
     size_t pos_q2 = buf.chunks_q2_beg[res.i_q2_chunk];
 
@@ -1103,7 +1089,6 @@ bool print_and_verify_solution(const PipelineBuffer &buf, const EvalResult &res,
     size_t len;
     concat_vectors(solution_1d, len, vectors, offsets);
 
-    /* We found a solution. Construct it, print it, and return. */
     if (!ms_inst.is_solution_feasible(solution_1d, len))
     {
         printf("Error, solution is not feasible!\n");
@@ -1118,7 +1103,6 @@ bool print_and_verify_solution(const PipelineBuffer &buf, const EvalResult &res,
     return true;
 }
 
-// Analog Grup A4: window kardinalitas [k_min,k_max] utk subset-sum 1D.
 template <typename T>
 std::pair<size_t, size_t> compute_k_window(const std::vector<T> &values, T target)
 {
@@ -1134,11 +1118,10 @@ std::pair<size_t, size_t> compute_k_window(const std::vector<T> &values, T targe
         if (P[k] >= target && k_min == SIZE_MAX) k_min = k;
         if (S[n - k] <= target) { k_max = k; found = true; }
     }
-    if (k_min == SIZE_MAX || !found || k_max < k_min) return {1, 0}; // window kosong
+    if (k_min == SIZE_MAX || !found || k_max < k_min) return {1, 0};
     return {k_min, k_max};
 }
 
-// Analog Grup F: k dengan estimasi share solusi tertinggi di dalam window.
 template <typename T>
 size_t compute_peak_k(const std::vector<T> &values, T target, size_t k_min, size_t k_max)
 {
@@ -1214,8 +1197,6 @@ std::vector<std::pair<size_t, double>> compute_k_priority_profile(const std::vec
     return profile;
 }
 
-// Berapa rentang kardinalitas quarter INI yg masih mungkin, mengingat
-// 3 quarter lain bisa menyumbang antara 0..n_others_total.
 inline std::pair<size_t, size_t> quarter_k_bounds(size_t n_this, size_t n_others_total,
                                                   size_t k_target_lo, size_t k_target_hi)
 {
@@ -1230,8 +1211,6 @@ filter_by_cardinality(const std::vector<T> &weights, size_t k_lo, size_t k_hi)
 {
     const size_t n = weights.size();
 
-    /* [OPT] Pass 1: kardinalitas via _mm_popcnt_u64 (SSE4.2 eksplisit).
-     * Hitung n_valid dahulu -> pre-alokasi tepat, zero realloc. */
     size_t n_valid = 0;
     std::vector<uint8_t> valid_mask(n);
     for (size_t i = 0; i < n; ++i)
@@ -1243,13 +1222,9 @@ filter_by_cardinality(const std::vector<T> &weights, size_t k_lo, size_t k_hi)
         n_valid += ok;
     }
 
-    /* Pre-alokasi ukuran tepat */
     std::vector<T>      fw(n_valid);
     std::vector<size_t> fm(n_valid);
 
-    /* [OPT] Pass 2: branchless scatter -> nol branch misprediction.
-     * Tulis ke fw[out]/fm[out] selalu; 'out' maju hanya jika valid.
-     * Branch-free -> compiler dapat auto-vektorisasi loop ini. */
     size_t out = 0;
     for (size_t i = 0; i < n; ++i)
     {
@@ -1374,7 +1349,7 @@ bool shroeppel_shamir_1d(const std::vector<T> &values, T target, const std::stri
     auto set4_weights_full = generate_subsets(list4);
 
     const size_t n1 = list1.size(), n2 = list2.size(), n3 = list3.size(), n4 = list4.size();
-    /* [OPT] k_radius: -1 = semua k, 0 = hanya peak_k, r = peak_k ± r */
+    
     for (const auto &k_entry : k_priority)
     {
     if (k_radius >= 0 && std::abs((int64_t)k_entry.first - (int64_t)peak_k) > (int64_t)k_radius)
@@ -1412,29 +1387,33 @@ bool shroeppel_shamir_1d(const std::vector<T> &values, T target, const std::stri
     if (set2_weights_sorted_asc.empty() || set4_weights_sorted_desc.empty())
         continue;
 
-    auto min_cmp = [&](std::pair<size_t, size_t> a1, std::pair<size_t, size_t> a2) -> bool
+    auto min_cmp = [](const HeapNode<T> &a1, const HeapNode<T> &a2) noexcept -> bool
     {
-        return set1_weights[a1.first] + set2_weights_sorted_asc[a1.second] > set1_weights[a2.first] + set2_weights_sorted_asc[a2.second];
+        return a1.score > a2.score;
     };
 
-    auto max_cmp = [&](std::pair<size_t, size_t> a1, std::pair<size_t, size_t> a2) -> bool
+    auto max_cmp = [](const HeapNode<T> &a1, const HeapNode<T> &a2) noexcept -> bool
     {
-        return set3_weights[a1.first] + set4_weights_sorted_desc[a1.second] < set3_weights[a2.first] + set4_weights_sorted_desc[a2.second];
+        return a1.score < a2.score;
     };
 
-    std::vector<std::pair<size_t, size_t>> heap1;
+    std::vector<HeapNode<T>> heap1;
     heap1.reserve(set1_weights.size());
-    std::vector<std::pair<size_t, size_t>> heap2;
+    std::vector<HeapNode<T>> heap2;
     heap2.reserve(set3_weights.size());
 
     for (size_t i = 0; i < set1_weights.size(); ++i)
     {
-        if (set1_weights[i] + set2_weights_sorted_asc[0] <= target)
-            heap1.emplace_back(i, 0);
+        const T initial_score = set1_weights[i] + set2_weights_sorted_asc[0];
+        if (initial_score <= target)
+            heap1.push_back({initial_score, i, 0});
     }
 
     for (size_t i = 0; i < set3_weights.size(); ++i)
-        heap2.emplace_back(i, 0);
+    {
+        const T initial_score = set3_weights[i] + set4_weights_sorted_desc[0];
+        heap2.push_back({initial_score, i, 0});
+    }
 
     std::make_heap(heap1.begin(), heap1.end(), min_cmp);
     std::make_heap(heap2.begin(), heap2.end(), max_cmp);
@@ -1445,8 +1424,8 @@ bool shroeppel_shamir_1d(const std::vector<T> &values, T target, const std::stri
     size_t i_iter_checking = 0;
     while (!heap1.empty() && !heap2.empty())
     {
-        const T score_pair1 = set1_weights[heap1.front().first] + set2_weights_sorted_asc[heap1.front().second];
-        const T score_pair2 = set3_weights[heap2.front().first] + set4_weights_sorted_desc[heap2.front().second];
+        const T score_pair1 = heap1.front().score;
+        const T score_pair2 = heap2.front().score;
         const T score = score_pair1 + score_pair2;
 
         if (score == target)
@@ -1460,7 +1439,11 @@ bool shroeppel_shamir_1d(const std::vector<T> &values, T target, const std::stri
             extract_pairs_from_heap<false, T>(same_score_q2, heap2, score_pair2, chunks_q2_beg, chunks_q2_n_pairs, n_pairs_q2, set3_weights, set4_weights, set4_weights_sorted_desc, max_cmp);
 
             ++i_iter_checking;
-            print_info_line(i_iter_checking, profilerTotal->elapsed(), score_pair1, score_pair2, n_pairs_q1, n_pairs_q2);
+            print_info_line(
+#ifdef WITH_GPU
+                GpuData{}, false,
+#endif
+                i_iter_checking, profilerTotal->elapsed(), score_pair1, score_pair2, n_pairs_q1, n_pairs_q2);
 
             if (!same_score_q1.empty() && !same_score_q2.empty())
             {
@@ -1488,12 +1471,26 @@ bool shroeppel_shamir_1d(const std::vector<T> &values, T target, const std::stri
             while (pos_set2_weights + 1 < set2_weights.size() &&
                    (set2_weights_sorted_asc[pos_set2_weights] == set2_weights_sorted_asc[pair1.second] ||
                     (set1_weights[pair1.first] + set2_weights_sorted_asc[pos_set2_weights] + score_pair2) < target))
-                ++pos_set2_weights;
-
-            if (pos_set2_weights < set2_weights.size() && set1_weights[pair1.first] + set2_weights_sorted_asc[pos_set2_weights] <= target)
             {
-                heap1.emplace_back(pair1.first, pos_set2_weights);
-                std::push_heap(heap1.begin(), heap1.end(), min_cmp);
+                size_t step = 1;
+                while (pos_set2_weights + step + 1 < set2_weights.size() &&
+                       (set2_weights_sorted_asc[pos_set2_weights + step] == set2_weights_sorted_asc[pair1.second] ||
+                        (set1_weights[pair1.first] + set2_weights_sorted_asc[pos_set2_weights + step] + score_pair2) < target))
+                {
+                    pos_set2_weights += step;
+                    step <<= 1;
+                }
+                ++pos_set2_weights;
+            }
+
+            if (pos_set2_weights < set2_weights.size())
+            {
+                const T next_score = set1_weights[pair1.first] + set2_weights_sorted_asc[pos_set2_weights];
+                if (next_score <= target)
+                {
+                    heap1.push_back({next_score, pair1.first, pos_set2_weights});
+                    std::push_heap(heap1.begin(), heap1.end(), min_cmp);
+                }
             }
         }
         else
@@ -1507,12 +1504,26 @@ bool shroeppel_shamir_1d(const std::vector<T> &values, T target, const std::stri
             while (pos_set4_weights + 1 < set4_weights.size() &&
                    (set4_weights_sorted_desc[pos_set4_weights] == set4_weights_sorted_desc[pair2.second] ||
                     (score_pair1 + set3_weights[pair2.first] + set4_weights_sorted_desc[pos_set4_weights]) > target))
-                ++pos_set4_weights;
-
-            if (pos_set4_weights < set4_weights.size() && set3_weights[pair2.first] + set4_weights_sorted_desc[pos_set4_weights] <= target)
             {
-                heap2.emplace_back(pair2.first, pos_set4_weights);
-                std::push_heap(heap2.begin(), heap2.end(), max_cmp);
+                size_t step = 1;
+                while (pos_set4_weights + step + 1 < set4_weights.size() &&
+                       (set4_weights_sorted_desc[pos_set4_weights + step] == set4_weights_sorted_desc[pair2.second] ||
+                        (score_pair1 + set3_weights[pair2.first] + set4_weights_sorted_desc[pos_set4_weights + step]) > target))
+                {
+                    pos_set4_weights += step;
+                    step <<= 1;
+                }
+                ++pos_set4_weights;
+            }
+
+            if (pos_set4_weights < set4_weights.size())
+            {
+                const T next_score = set3_weights[pair2.first] + set4_weights_sorted_desc[pos_set4_weights];
+                if (next_score <= target)
+                {
+                    heap2.push_back({next_score, pair2.first, pos_set4_weights});
+                    std::push_heap(heap2.begin(), heap2.end(), max_cmp);
+                }
             }
         }
     }
@@ -1521,19 +1532,123 @@ bool shroeppel_shamir_1d(const std::vector<T> &values, T target, const std::stri
     return false;
 }
 
+std::string checkpoint_path_for_instance(const std::string &instance_name)
+{
+    return instance_name.empty() ? std::string() : (instance_name + ".ckpt");
+}
+
+std::vector<size_t> load_checkpoint_completed_k(const std::string &instance_name)
+{
+    std::vector<size_t> completed;
+    const auto path = checkpoint_path_for_instance(instance_name);
+    if (path.empty())
+        return completed;
+
+    std::ifstream file(path);
+    if (!file.is_open())
+        return completed;
+
+    size_t k;
+    while (file >> k)
+        completed.push_back(k);
+
+    if (!completed.empty())
+        std::cout << "Checkpoint ditemukan (" << path << "): " << completed.size()
+                  << " nilai k sudah selesai dievaluasi sebelumnya, akan di-skip.\n";
+
+    return completed;
+}
+
+void append_checkpoint_completed_k(const std::string &instance_name, size_t k)
+{
+    const auto path = checkpoint_path_for_instance(instance_name);
+    if (path.empty())
+        return;
+    std::ofstream file(path, std::ios::app);
+    if (file.is_open())
+        file << k << "\n";
+}
+
+void clear_checkpoint(const std::string &instance_name)
+{
+    const auto path = checkpoint_path_for_instance(instance_name);
+    if (path.empty())
+        return;
+    std::remove(path.c_str());
+}
+
 template <typename T>
+struct KSetupResult
+{
+    bool valid = false;
+    std::vector<T> set1_weights, set3_weights;
+    std::vector<size_t> set1_subsets, set3_subsets;
+    std::vector<T> set2_weights_sorted_asc, set4_weights_sorted_desc;
+    std::vector<size_t> set2_subsets_sorted_asc, set4_subsets_sorted_desc;
+    std::vector<size_t> set1_scores, set2_scores_sorted_asc, set3_scores, set4_scores_sorted_desc;
+};
+
+template <typename T>
+KSetupResult<T> compute_k_setup(const MarkShareFeas &ms_inst,
+                                const std::vector<T> &set1_weights_full, const std::vector<T> &set2_weights_full,
+                                const std::vector<T> &set3_weights_full, const std::vector<T> &set4_weights_full,
+                                size_t n1, size_t n2, size_t n3, size_t n4, size_t k_focus,
+                                const std::vector<size_t> &offsets, size_t reduce_dim, size_t leftover_dim)
+{
+    KSetupResult<T> res;
+
+    auto b1 = quarter_k_bounds(n1, n2 + n3 + n4, k_focus, k_focus);
+    auto b2 = quarter_k_bounds(n2, n1 + n3 + n4, k_focus, k_focus);
+    auto b3 = quarter_k_bounds(n3, n1 + n2 + n4, k_focus, k_focus);
+    auto b4 = quarter_k_bounds(n4, n1 + n2 + n3, k_focus, k_focus);
+
+    auto filtered1 = filter_by_cardinality(set1_weights_full, b1.first, b1.second);
+    auto filtered2 = filter_by_cardinality(set2_weights_full, b2.first, b2.second);
+    auto filtered3 = filter_by_cardinality(set3_weights_full, b3.first, b3.second);
+    auto filtered4 = filter_by_cardinality(set4_weights_full, b4.first, b4.second);
+
+    if (filtered2.first.empty() || filtered4.first.empty())
+        return res;
+
+    res.set1_weights = std::move(filtered1.first);
+    res.set1_subsets = std::move(filtered1.second);
+    res.set3_weights = std::move(filtered3.first);
+    res.set3_subsets = std::move(filtered3.second);
+
+    auto &set2_weights = filtered2.first;
+    auto &set2_subsets = filtered2.second;
+    auto &set4_weights = filtered4.first;
+    auto &set4_subsets = filtered4.second;
+
+    auto asc_indices_set2_weights = sort_indices(set2_weights, true);
+    auto desc_indices_set4_weights = sort_indices(set4_weights, false);
+
+    res.set2_weights_sorted_asc = apply_permutation(set2_weights, asc_indices_set2_weights);
+    res.set2_subsets_sorted_asc = apply_permutation(set2_subsets, asc_indices_set2_weights);
+    res.set4_weights_sorted_desc = apply_permutation(set4_weights, desc_indices_set4_weights);
+    res.set4_subsets_sorted_desc = apply_permutation(set4_subsets, desc_indices_set4_weights);
+
+    res.set1_scores.resize(res.set1_subsets.size() * leftover_dim);
+    res.set2_scores_sorted_asc.resize(res.set2_subsets_sorted_asc.size() * leftover_dim);
+    res.set3_scores.resize(res.set3_subsets.size() * leftover_dim);
+    res.set4_scores_sorted_desc.resize(res.set4_subsets_sorted_desc.size() * leftover_dim);
+
+    compute_scores_cpu(ms_inst, res.set1_scores, res.set1_subsets, offsets[0], reduce_dim);
+    compute_scores_cpu(ms_inst, res.set2_scores_sorted_asc, res.set2_subsets_sorted_asc, offsets[1], reduce_dim);
+    compute_scores_cpu(ms_inst, res.set3_scores, res.set3_subsets, offsets[2], reduce_dim);
+    compute_scores_cpu(ms_inst, res.set4_scores_sorted_desc, res.set4_subsets_sorted_desc, offsets[3], reduce_dim);
+
+    res.valid = true;
+    return res;
+}
+
+template<class T>
 bool shroeppel_shamir_dim_reduced(const MarkShareFeas &ms_inst, bool run_on_gpu, const std::string &instance_name, size_t n_reduce_max,
                                   int k_radius = -1)
 {
     std::cout << "Running reduced dim shroeppel shamir" << std::endl;
     std::cout << "Running with " << omp_get_max_threads() << " threads" << std::endl;
 
-    /* First, attempt some dimensionality reduction/perfect hashing.
-     * We know that 0 <= A[i][j] <= 200 and thus sum_j A[i][j] <= n * 200.
-     *
-     * So, reserving n * 200 + 1 intervals for each of the entries i of a vector A.j we have an overlap free combination.
-     * The amount of dimension we can remove this way is limited by the maximum value of T, the index type we are using for the 1-dimensional subset sum problem.
-     */
     constexpr size_t max_coeff = 200;
     const size_t n_cols = ms_inst.n();
 
@@ -1547,7 +1662,6 @@ bool shroeppel_shamir_dim_reduced(const MarkShareFeas &ms_inst, bool run_on_gpu,
     const auto &subset_sum_1d = reduced_problem.first;
     const auto subset_sum_1d_rhs = reduced_problem.second;
 
-    // >>> BARU: hitung window k & urutan prioritas Grup F utk instance 1D ini
     auto [k_min, k_max] = compute_k_window(subset_sum_1d, subset_sum_1d_rhs);
     if (k_min > k_max) { printf("UNSAT (cardinality window kosong)!\n"); return false; }
     const auto k_priority = compute_k_priority_profile(subset_sum_1d, subset_sum_1d_rhs, k_min, k_max);
@@ -1559,7 +1673,6 @@ bool shroeppel_shamir_dim_reduced(const MarkShareFeas &ms_inst, bool run_on_gpu,
     for (const auto &entry : k_priority)
         std::cout << " " << entry.first << "(" << std::fixed << std::setprecision(2) << entry.second * 100.0 << "%)";
     std::cout << "\n";
-    // <
 
     const size_t split_index1 = subset_sum_1d.size() / 4;
     const size_t split_index2 = subset_sum_1d.size() / 2;
@@ -1585,95 +1698,113 @@ bool shroeppel_shamir_dim_reduced(const MarkShareFeas &ms_inst, bool run_on_gpu,
     auto set4_weights_full = generate_subsets(list4);
 
     size_t n1 = list1.size(), n2 = list2.size(), n3 = list3.size(), n4 = list4.size();
-    /* [OPT] k_radius: -1 = semua k, 0 = hanya peak_k, r = peak_k ± r */
-    for (const auto &k_entry : k_priority)
+
+    const auto checkpoint_completed_k = load_checkpoint_completed_k(instance_name);
+    auto k_already_done = [&checkpoint_completed_k](size_t k) {
+        return std::find(checkpoint_completed_k.begin(), checkpoint_completed_k.end(), k) != checkpoint_completed_k.end();
+    };
+
+#if defined(ENABLE_K_PREFETCH)
+    std::future<KSetupResult<T>> next_k_setup_future;
+    int64_t next_k_prefetch_idx = -1;
+#endif
+
+    for (size_t i_k = 0; i_k < k_priority.size(); ++i_k)
     {
+    const auto &k_entry = k_priority[i_k];
     if (k_radius >= 0 && std::abs((int64_t)k_entry.first - (int64_t)peak_k) > (int64_t)k_radius)
         continue;
+    if (k_already_done(k_entry.first))
+    {
+        std::cout << "\nSkip k=" << k_entry.first << " (sudah selesai di checkpoint sebelumnya)\n";
+        continue;
+    }
     std::cout << "\nTrying k=" << k_entry.first << " (priority share "
               << std::fixed << std::setprecision(2) << k_entry.second * 100.0 << "%)\n";
-    size_t k_focus_lo = k_entry.first, k_focus_hi = k_entry.first;
 
-    auto b1 = quarter_k_bounds(n1, n2 + n3 + n4, k_focus_lo, k_focus_hi);
-    auto b2 = quarter_k_bounds(n2, n1 + n3 + n4, k_focus_lo, k_focus_hi);
-    auto b3 = quarter_k_bounds(n3, n1 + n2 + n4, k_focus_lo, k_focus_hi);
-    auto b4 = quarter_k_bounds(n4, n1 + n2 + n3, k_focus_lo, k_focus_hi);
+    KSetupResult<T> setup;
+#if defined(ENABLE_K_PREFETCH)
+    if (next_k_prefetch_idx == (int64_t)i_k && next_k_setup_future.valid())
+        setup = next_k_setup_future.get();
+    else
+#endif
+        setup = compute_k_setup<T>(ms_inst, set1_weights_full, set2_weights_full, set3_weights_full, set4_weights_full, n1, n2, n3, n4, k_entry.first, offsets, reduce_dim, leftover_dim);
 
-    auto filtered1 = filter_by_cardinality(set1_weights_full, b1.first, b1.second);
-    auto filtered2 = filter_by_cardinality(set2_weights_full, b2.first, b2.second);
-    auto filtered3 = filter_by_cardinality(set3_weights_full, b3.first, b3.second);
-    auto filtered4 = filter_by_cardinality(set4_weights_full, b4.first, b4.second);
-
-    auto &set1_weights = filtered1.first;
-    auto &set1_subsets = filtered1.second;
-    auto &set2_weights = filtered2.first;
-    auto &set2_subsets = filtered2.second;
-    auto &set3_weights = filtered3.first;
-    auto &set3_subsets = filtered3.second;
-    auto &set4_weights = filtered4.first;
-    auto &set4_subsets = filtered4.second;
-    // <
-
-    if (set2_weights.empty() || set4_weights.empty())
+    if (!setup.valid)
         continue;
 
-    /* Sort set2_weights ascending, set4_weights descending. */
-    auto asc_indices_set2_weights = sort_indices(set2_weights, true);
-    auto desc_indices_set4_weights = sort_indices(set4_weights, false);
+    auto &set1_weights = setup.set1_weights;
+    auto &set1_subsets = setup.set1_subsets;
+    auto &set3_weights = setup.set3_weights;
+    auto &set3_subsets = setup.set3_subsets;
+    const auto &set2_weights_sorted_asc = setup.set2_weights_sorted_asc;
+    const auto &set2_subsets_sorted_asc = setup.set2_subsets_sorted_asc;
+    const auto &set4_weights_sorted_desc = setup.set4_weights_sorted_desc;
+    const auto &set4_subsets_sorted_desc = setup.set4_subsets_sorted_desc;
+    const auto &set2_weights = setup.set2_weights_sorted_asc;
+    const auto &set4_weights = setup.set4_weights_sorted_desc;
+    auto &set1_scores = setup.set1_scores;
+    auto &set2_scores_sorted_asc = setup.set2_scores_sorted_asc;
+    auto &set3_scores = setup.set3_scores;
+    auto &set4_scores_sorted_desc = setup.set4_scores_sorted_desc;
 
-    const auto set2_weights_sorted_asc = apply_permutation(set2_weights, asc_indices_set2_weights);
-    const auto set2_subsets_sorted_asc = apply_permutation(set2_subsets, asc_indices_set2_weights);
-
-    const auto set4_weights_sorted_desc = apply_permutation(set4_weights, desc_indices_set4_weights);
-    const auto set4_subsets_sorted_desc = apply_permutation(set4_subsets, desc_indices_set4_weights);
-
-    std::vector<size_t> set1_scores(set1_subsets.size() * leftover_dim);
-    std::vector<size_t> set2_scores_sorted_asc(set2_subsets.size() * leftover_dim);
-    std::vector<size_t> set3_scores(set3_subsets.size() * leftover_dim);
-    std::vector<size_t> set4_scores_sorted_desc(set4_subsets.size() * leftover_dim);
-
-    compute_scores_cpu(ms_inst, set1_scores, set1_subsets, offsets[0], reduce_dim);
-    compute_scores_cpu(ms_inst, set2_scores_sorted_asc, set2_subsets_sorted_asc, offsets[1], reduce_dim);
-    compute_scores_cpu(ms_inst, set3_scores, set3_subsets, offsets[2], reduce_dim);
-    compute_scores_cpu(ms_inst, set4_scores_sorted_desc, set4_subsets_sorted_desc, offsets[3], reduce_dim);
+    const std::vector<T> asc_indices_set2_weights;
+    const std::vector<T> desc_indices_set4_weights;
 
 #ifdef WITH_GPU
     GpuData gpu_data(ms_inst, set1_scores, set2_scores_sorted_asc, set3_scores, set4_scores_sorted_desc);
 #endif
 
-    /* Create the priority queues q1 consisting of pairs {(i, 0) | i \in set1_weights} and q2 consisting of {(i, 0) | i \in set3_weights}. The priority/score for a pair (i, j)
-     * is given set1_weights[i] + set2_weights[j] if the pair is in q1 and set3_weights[i] + set4_weights[j] if the pair is in q2. */
-
-    /* Compare returns true if the first argument comes BEFORE the second argument. Since however the priority queue outputs the largest element first,
-     * we have to flip the > signs. */
-    auto min_cmp = [&](std::pair<T, T> a1, std::pair<T, T> a2) -> bool
+#if defined(ENABLE_K_PREFETCH)
+    size_t j_k = i_k + 1;
+    while (j_k < k_priority.size() &&
+           ((k_radius >= 0 && std::abs((int64_t)k_priority[j_k].first - (int64_t)peak_k) > (int64_t)k_radius) ||
+            k_already_done(k_priority[j_k].first)))
+        ++j_k;
+    if (j_k < k_priority.size())
     {
-        return set1_weights[a1.first] + set2_weights_sorted_asc[a1.second] > set1_weights[a2.first] + set2_weights_sorted_asc[a2.second];
+        next_k_prefetch_idx = (int64_t)j_k;
+        const size_t k_focus_next = k_priority[j_k].first;
+        next_k_setup_future = std::async(std::launch::async,
+            [&ms_inst, &set1_weights_full, &set2_weights_full, &set3_weights_full, &set4_weights_full,
+             n1, n2, n3, n4, k_focus_next, &offsets, reduce_dim, leftover_dim]()
+            {
+                return compute_k_setup<T>(ms_inst, set1_weights_full, set2_weights_full, set3_weights_full, set4_weights_full, n1, n2, n3, n4, k_focus_next, offsets, reduce_dim, leftover_dim);
+            });
+    }
+    else
+    {
+        next_k_prefetch_idx = -1;
+    }
+#endif
+
+    auto min_cmp = [](const HeapNode<T> &a1, const HeapNode<T> &a2) noexcept -> bool
+    {
+        return a1.score > a2.score;
     };
 
-    auto max_cmp = [&](std::pair<T, T> a1, std::pair<T, T> a2) -> bool
+    auto max_cmp = [](const HeapNode<T> &a1, const HeapNode<T> &a2) noexcept -> bool
     {
-        return set3_weights[a1.first] + set4_weights_sorted_desc[a1.second] < set3_weights[a2.first] + set4_weights_sorted_desc[a2.second];
+        return a1.score < a2.score;
     };
 
-    /* Vectors used to count the number of elements extracted from q1/q2 with the same solution value. */
-    /* Each tuple {a, b, c, d} will describe the range of pairs <a, b> ... <a, b + c - 1>; d denotes the offset of the pairs within a list of all pairs. */
-    std::vector<std::pair<size_t, size_t>> heap1;
+    std::vector<HeapNode<T>> heap1;
     heap1.reserve(set1_weights.size());
-    std::vector<std::pair<size_t, size_t>> heap2;
+    std::vector<HeapNode<T>> heap2;
     heap2.reserve(set3_weights.size());
 
-    // TODO: the initial insert can likely be improved by simple sorting.
     for (size_t i = 0; i < set1_weights.size(); ++i)
     {
-        /* If already the sum of these 2 elements is greater than the right hand side we can skip them. Subsequent combinations (e.g. with higher pos_subset2)
-         * will only be even larger. */
-        if (set1_weights[i] + set2_weights_sorted_asc[0] <= subset_sum_1d_rhs)
-            heap1.emplace_back(i, 0);
+        const T initial_score = set1_weights[i] + set2_weights_sorted_asc[0];
+        if (initial_score <= subset_sum_1d_rhs)
+            heap1.push_back({initial_score, i, 0});
     }
 
     for (size_t i = 0; i < set3_weights.size(); ++i)
-        heap2.emplace_back(i, 0);
+    {
+        const T initial_score = set3_weights[i] + set4_weights_sorted_desc[0];
+        heap2.push_back({initial_score, i, 0});
+    }
 
     std::make_heap(heap1.begin(), heap1.end(), min_cmp);
     std::make_heap(heap2.begin(), heap2.end(), max_cmp);
@@ -1699,23 +1830,18 @@ bool shroeppel_shamir_dim_reduced(const MarkShareFeas &ms_inst, bool run_on_gpu,
 
     while (!heap1.empty() && !heap2.empty())
     {
-        /* score_pair1 is the currently lowest score in {set1_weights, set2_weights} we are still considering */
-        const T score_pair1 = set1_weights[heap1.front().first] + set2_weights_sorted_asc[heap1.front().second];
-        /* score_pair2 is the currently highest score in {set3_weights, set4_weights} we are still considering */
-        const T score_pair2 = set3_weights[heap2.front().first] + set4_weights_sorted_desc[heap2.front().second];
+        const T score_pair1 = heap1.front().score;
+        const T score_pair2 = heap2.front().score;
 
         const T score = score_pair1 + score_pair2;
 
         if (score == subset_sum_1d_rhs)
         {
-            /* Extract all tuples from both lists with equal scores. Potentially, we subdivide extracted tuples into chunks to not overflow the GPU memory. We remember the start and number of pairs in each chunk. */
             auto &buf_curr = buffers[curr];
             auto &buf_next = buffers[next];
             assert(buf_curr.state == EMPTY);
             buf_curr.state = EXTRACTING;
 
-            /* Reset the buffer. */
-            /* Clear vectors but keep their old capacity. */
             buf_curr.same_score_q1.clear();
             buf_curr.same_score_q2.clear();
 
@@ -1735,7 +1861,6 @@ bool shroeppel_shamir_dim_reduced(const MarkShareFeas &ms_inst, bool run_on_gpu,
 
             auto profiler_cand_extraction = std::make_unique<ScopedProfiler>("Candidate extraction        ");
 
-            /* In CPU parallel, extract equal tuples from each heap. */
 #pragma omp parallel sections num_threads(2)
             {
 #pragma omp section
@@ -1757,16 +1882,15 @@ bool shroeppel_shamir_dim_reduced(const MarkShareFeas &ms_inst, bool run_on_gpu,
 #endif
                 i_iter_checking, profilerTotal->elapsed(), score_pair1, score_pair2, buf_curr.n_pairs_q1, buf_curr.n_pairs_q2);
 
-            /* Before submitting the current buffer, wait until the last one is finished. */
             if (buf_next.state != EMPTY)
             {
                 eval_future[next].wait();
                 const auto &result = eval_future[next].get();
                 assert(buf_next.state == EVALUATED);
 
-                /* Check the result - break if we are done. */
                 if (result.found)
                 {
+                    clear_checkpoint(instance_name);
                     return print_and_verify_solution(buf_next, result, ms_inst, subset_sum_1d, offsets, asc_indices_set2_weights, desc_indices_set4_weights, set1_subsets, set2_subsets_sorted_asc, set3_subsets, set4_subsets_sorted_desc, list1, list2, list3, list4, instance_name
 #ifndef NDEBUG
                                                      ,
@@ -1782,7 +1906,6 @@ bool shroeppel_shamir_dim_reduced(const MarkShareFeas &ms_inst, bool run_on_gpu,
             assert(buf_next.state == EMPTY);
 
             buf_curr.state = EVALUATING;
-            /* Launch evaluation in background thread. */
             eval_future[curr] = std::async(std::launch::async, [&]()
                                            { return evaluate_gpu_or_cpu(buf_curr,
 #ifdef WITH_GPU
@@ -1790,7 +1913,6 @@ bool shroeppel_shamir_dim_reduced(const MarkShareFeas &ms_inst, bool run_on_gpu,
 #endif
                                                                         ms_inst, reduce_dim, set1_scores, set2_scores_sorted_asc, set3_scores, set4_scores_sorted_desc, set1_subsets, set2_subsets_sorted_asc, set3_subsets, set4_subsets_sorted_desc, subset_sum_1d, offsets, run_on_gpu); });
 
-            /* Switch buffer. */
             curr = next;
             next = 1 - curr;
         }
@@ -1804,14 +1926,29 @@ bool shroeppel_shamir_dim_reduced(const MarkShareFeas &ms_inst, bool run_on_gpu,
 
             ++pos_set2_weights;
 
-            while (pos_set2_weights + 1 < set2_weights.size() && (set2_weights_sorted_asc[pos_set2_weights] == set2_weights_sorted_asc[pair1.second] || (set1_weights[pair1.first] + set2_weights_sorted_asc[pos_set2_weights] + score_pair2) < subset_sum_1d_rhs))
-                ++pos_set2_weights;
-
-            /* Again, the element in q1 can only increase (or stay equal). So ignore elements that are already too big. */
-            if (pos_set2_weights < set2_weights.size() && set1_weights[pair1.first] + set2_weights_sorted_asc[pos_set2_weights] <= subset_sum_1d_rhs)
+            while (pos_set2_weights + 1 < set2_weights.size() &&
+                   (set2_weights_sorted_asc[pos_set2_weights] == set2_weights_sorted_asc[pair1.second] ||
+                    (set1_weights[pair1.first] + set2_weights_sorted_asc[pos_set2_weights] + score_pair2) < subset_sum_1d_rhs))
             {
-                heap1.emplace_back(pair1.first, pos_set2_weights);
-                std::push_heap(heap1.begin(), heap1.end(), min_cmp);
+                size_t step = 1;
+                while (pos_set2_weights + step + 1 < set2_weights.size() &&
+                       (set2_weights_sorted_asc[pos_set2_weights + step] == set2_weights_sorted_asc[pair1.second] ||
+                        (set1_weights[pair1.first] + set2_weights_sorted_asc[pos_set2_weights + step] + score_pair2) < subset_sum_1d_rhs))
+                {
+                    pos_set2_weights += step;
+                    step <<= 1;
+                }
+                ++pos_set2_weights;
+            }
+
+            if (pos_set2_weights < set2_weights.size())
+            {
+                const T next_score = set1_weights[pair1.first] + set2_weights_sorted_asc[pos_set2_weights];
+                if (next_score <= subset_sum_1d_rhs)
+                {
+                    heap1.push_back({next_score, pair1.first, pos_set2_weights});
+                    std::push_heap(heap1.begin(), heap1.end(), min_cmp);
+                }
             }
         }
         else if (score > subset_sum_1d_rhs)
@@ -1824,14 +1961,29 @@ bool shroeppel_shamir_dim_reduced(const MarkShareFeas &ms_inst, bool run_on_gpu,
 
             ++pos_set4_weights;
 
-            /* Skip all entries in set4_weights until we find a smaller one. */
-            while (pos_set4_weights + 1 < set4_weights.size() && (set4_weights_sorted_desc[pos_set4_weights] == set4_weights_sorted_desc[pair2.second] || (score_pair1 + set3_weights[pair2.first] + set4_weights_sorted_desc[pos_set4_weights]) > subset_sum_1d_rhs))
-                ++pos_set4_weights;
-
-            if (pos_set4_weights < set4_weights.size() && set3_weights[pair2.first] + set4_weights_sorted_desc[pos_set4_weights] <= subset_sum_1d_rhs)
+            while (pos_set4_weights + 1 < set4_weights.size() &&
+                   (set4_weights_sorted_desc[pos_set4_weights] == set4_weights_sorted_desc[pair2.second] ||
+                    (score_pair1 + set3_weights[pair2.first] + set4_weights_sorted_desc[pos_set4_weights]) > subset_sum_1d_rhs))
             {
-                heap2.emplace_back(pair2.first, pos_set4_weights);
-                std::push_heap(heap2.begin(), heap2.end(), max_cmp);
+                size_t step = 1;
+                while (pos_set4_weights + step + 1 < set4_weights.size() &&
+                       (set4_weights_sorted_desc[pos_set4_weights + step] == set4_weights_sorted_desc[pair2.second] ||
+                        (score_pair1 + set3_weights[pair2.first] + set4_weights_sorted_desc[pos_set4_weights + step]) > subset_sum_1d_rhs))
+                {
+                    pos_set4_weights += step;
+                    step <<= 1;
+                }
+                ++pos_set4_weights;
+            }
+
+            if (pos_set4_weights < set4_weights.size())
+            {
+                const T next_score = set3_weights[pair2.first] + set4_weights_sorted_desc[pos_set4_weights];
+                if (next_score <= subset_sum_1d_rhs)
+                {
+                    heap2.push_back({next_score, pair2.first, pos_set4_weights});
+                    std::push_heap(heap2.begin(), heap2.end(), max_cmp);
+                }
             }
         }
     }
@@ -1849,6 +2001,7 @@ bool shroeppel_shamir_dim_reduced(const MarkShareFeas &ms_inst, bool run_on_gpu,
 
             if (result.found)
             {
+                clear_checkpoint(instance_name);
                 return print_and_verify_solution(buf, result, ms_inst, subset_sum_1d, offsets, asc_indices_set2_weights, desc_indices_set4_weights, set1_subsets, set2_subsets_sorted_asc, set3_subsets, set4_subsets_sorted_desc, list1, list2, list3, list4, instance_name
 #ifndef NDEBUG
                                                  ,
@@ -1862,6 +2015,8 @@ bool shroeppel_shamir_dim_reduced(const MarkShareFeas &ms_inst, bool run_on_gpu,
             buf.state = EMPTY;
         }
     }
+
+    append_checkpoint_completed_k(instance_name, k_entry.first);
     }
 
     return false;
@@ -1869,15 +2024,13 @@ bool shroeppel_shamir_dim_reduced(const MarkShareFeas &ms_inst, bool run_on_gpu,
 
 std::string get_filename_without_extension(const std::string &filePath)
 {
-    // Find the last path separator.
+    
     size_t lastSlash = filePath.find_last_of("/\\");
     size_t start = (lastSlash == std::string::npos) ? 0 : lastSlash + 1;
 
-    // Find the last dot after the last slash
     size_t lastDot = filePath.find_last_of('.');
     size_t end = (lastDot == std::string::npos || lastDot < start) ? filePath.length() : lastDot;
 
-    // Extract the filename without extension
     return filePath.substr(start, end - start);
 }
 
@@ -1895,10 +2048,11 @@ int main(int argc, char *argv[])
     size_t n_threads = 0;
     bool check_only = false;
     bool write_prb = false;
-    int k_radius = -1; /* [OPT] -1 = semua k, 0 = peak_k saja, r = peak_k ± r */
+    int k_radius = -1;
     int runs = 0;
     double timeout_sec = 0.0;
     std::string solver = "ter";
+    double mem_budget_gb = 0.0;
 
     program.add_argument("-m", "--m")
         .store_into(m)
@@ -1951,16 +2105,19 @@ int main(int argc, char *argv[])
 
     program.add_argument("--max_pairs")
         .store_into(max_pairs_per_chunk)
-        .help("Maximum number of pairs to be evaluated on the GPU simultaneously. If GPU runs OOM, reduce this number.")
-        .default_value(3500000000);
+        .help("Maximum number of pairs to be evaluated on the GPU/CPU simultaneously. If it runs OOM, reduce this number. Default: dihitung otomatis dari --mem_budget_gb (lihat compute_default_max_pairs), BUKAN angka tetap.")
+        .default_value(size_t(0));
 
-    /* [OPT] k_radius: batasi eksplorasi k di sekitar peak_k */
+    program.add_argument("--mem_budget_gb")
+        .store_into(mem_budget_gb)
+        .help("Budget memori (GB) yang boleh dipakai untuk buffer per-pair saat evaluasi. 0 = auto-detect dari RAM sistem (lihat /proc/meminfo).")
+        .default_value(0.0);
+
     program.add_argument("--k_radius")
         .store_into(k_radius)
         .help("Radius eksplorasi k di sekitar peak_k. -1 = semua k (default), 0 = peak_k saja (tercepat), r = peak_k +/- r.")
         .default_value(-1);
 
-    /* [TER] CLI arguments */
     program.add_argument("--runs")
         .store_into(runs)
         .help("Number of runs/attempts for TER solver (default 0 = auto/1 run).")
@@ -1991,12 +2148,27 @@ int main(int argc, char *argv[])
         std::exit(1);
     }
 
-    /* Adjust n. */
     if (n == 0)
         n = (m - 1) * 10;
 
     check_only = (program["--check_only"] == true);
     write_prb = (program["--write_prb"] == true);
+
+    if (!program.is_used("--max_pairs"))
+    {
+        const size_t budget_bytes = (mem_budget_gb > 0.0)
+                                         ? static_cast<size_t>(mem_budget_gb * 1024.0 * 1024.0 * 1024.0)
+                                         : detect_system_ram_bytes();
+        max_pairs_per_chunk = compute_default_max_pairs(budget_bytes);
+        std::cout << "max_pairs_per_chunk auto-calibrated: " << max_pairs_per_chunk
+                  << " (from " << (budget_bytes / (1024.0 * 1024.0 * 1024.0)) << " GB budget"
+                  << (mem_budget_gb > 0.0 ? ", user-specified --mem_budget_gb)" : ", auto-detected RAM)") << "\n";
+    }
+    else if (max_pairs_per_chunk == 0)
+    {
+        std::cout << "Warning: --max_pairs 0 tidak valid, menggunakan fallback minimal 1000.\n";
+        max_pairs_per_chunk = 1000;
+    }
 
     const unsigned detected_threads = std::max(1u, std::thread::hardware_concurrency());
     const int threads_to_use = static_cast<int>(n_threads == 0 ? detected_threads : n_threads);
@@ -2012,7 +2184,6 @@ int main(int argc, char *argv[])
         const size_t seed_iter = seed + i_iter;
         MarkShareFeas instance;
 
-        /* Generate/read instance. For now, random instances. */
         if (!path.empty())
         {
             instance_name = get_filename_without_extension(path);
@@ -2041,7 +2212,6 @@ int main(int argc, char *argv[])
                 if (check_only)
                     continue;
 
-                /* [TER / SS Dispatch] */
                 bool found = false;
                 std::vector<uint64_t> vals64;
                 vals64.reserve(instance_1d.values.size());
@@ -2052,13 +2222,13 @@ int main(int argc, char *argv[])
                 if (solver == "ter")
                 {
                     std::cout << "[TER] Menggunakan TER Solver (Yang Li et al., 2025)\n";
-                    TerParams params = ter_default_params((int)vals64.size());
+                    TerParams params = ter_default_params((int)instance_1d.values.size());
                     params.fixed_runs = runs;
                     params.timeout_seconds = timeout_sec;
                     params.use_gpu = (program["--gpu"] == true);
                     if (program["--autorestart"] == true)
                     {
-                        params.max_restarts = 0; // infinite until found or timeout
+                        params.max_restarts = 0;
                         params.fixed_runs = 0;
                     }
                     else if (runs > 0)
@@ -2067,10 +2237,10 @@ int main(int argc, char *argv[])
                     }
                     else
                     {
-                        params.fixed_runs = 1; // single run if no autorestart and no runs specified
+                        params.fixed_runs = 1;
                     }
 
-                    TerResult res = ter_solve(vals64, target64, params);
+                    TerResult res = ter_solve(instance_1d.values, instance_1d.target, params);
                     found = res.found;
                     if (found)
                     {
@@ -2080,7 +2250,7 @@ int main(int argc, char *argv[])
                         std::cout << "\n";
 
                         std::string sol_name = instance_name + ".sol";
-                        std::string sol_str(vals64.size(), '0');
+                        std::string sol_str(instance_1d.values.size(), '0');
                         for (size_t idx : res.solution_indices) {
                             if (idx < sol_str.size()) sol_str[idx] = '1';
                         }
@@ -2126,9 +2296,6 @@ int main(int argc, char *argv[])
         printf("Running markshare: m=%zu, n=%zu, seed=%zu, iter=%zu, nthread=%d\n", instance.m(), instance.n(), seed_iter, i_iter, omp_get_max_threads());
         instance.print();
 
-        /* Solve the instance using one of the available algorithms. */
-
-        /* Create the one dimensional subset sum problem. */
         const bool on_gpu = (program["--gpu"] == true);
 #ifndef WITH_GPU
         if (on_gpu)

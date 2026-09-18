@@ -1,6 +1,3 @@
-// ter_kernel.cu — GPU Kernel for Level 1 Merge in TER Subset Sum Solver
-// Target Platform: NVIDIA Tesla T4 (sm_75) and modern CUDA architectures.
-
 #include "ter_kernel.cuh"
 #include <cuda_runtime.h>
 #include <algorithm>

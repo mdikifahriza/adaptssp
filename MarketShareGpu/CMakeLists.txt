@@ -53,11 +53,25 @@ target_compile_options(markshare_main PRIVATE -Wall -Wextra) # Warnings for C++
 if (ENABLE_NATIVE_OPT)
     if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(markshare_main PRIVATE
-            $<$<CONFIG:Release>:-O3 -DNDEBUG -march=native -mtune=native -msse4.2 -mpopcnt -flto=auto>
+            $<$<CONFIG:Release>:-O3 -DNDEBUG -march=native -mtune=native -msse4.2 -mpopcnt>
         )
-        target_link_options(markshare_main PRIVATE
-            $<$<CONFIG:Release>:-flto=auto>
-        )
+
+        # NOTE: -flto=auto is intentionally NOT enabled when CUDA is on.
+        # With CUDA_SEPARABLE_COMPILATION + multiple .cu translation units,
+        # nvcc device-linking embeds an internal `fatbinData` symbol per .cu
+        # file. GCC's LTO then tries to merge all object files (including
+        # nvcc's host-side stub objects) into one optimization unit at link
+        # time, and the two `fatbinData` symbols collide ("symbol
+        # `fatbinData' is already defined"), aborting the link. This is a
+        # known incompatibility between GCC LTO and nvcc's device-link step
+        # when there's more than one .cu file — not a bug in this project's
+        # code. LTO is still fully enabled for CPU-only builds.
+        if (NOT CUDA_ENABLED)
+            target_compile_options(markshare_main PRIVATE $<$<CONFIG:Release>:-flto=auto>)
+            target_link_options(markshare_main PRIVATE $<$<CONFIG:Release>:-flto=auto>)
+        else()
+            message(STATUS "LTO disabled for Release build: incompatible with CUDA device-linking (multiple .cu TUs).")
+        endif()
     elseif (MSVC)
         target_compile_options(markshare_main PRIVATE
             $<$<CONFIG:Release>:/O2 /DNDEBUG>

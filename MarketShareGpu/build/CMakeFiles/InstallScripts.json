@@ -1,0 +1,8 @@
+{
+	"InstallScripts" : 
+	[
+		"D:/adaptssp/MarketShareGpu/build/cmake_install.cmake",
+		"D:/adaptssp/MarketShareGpu/build/external/argparse/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

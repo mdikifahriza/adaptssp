@@ -20,12 +20,39 @@
 #include <string>
 
 // ─────────────────────────────────────────────────────────
+// 128-bit weight/target type. Weights and target are stored at full
+// precision so instances whose values or partial sums exceed 2^64
+// (e.g. instance_n64.prb) are solved correctly instead of silently
+// truncating/overflowing.
+// ─────────────────────────────────────────────────────────
+using ter_u128 = unsigned __int128;
+
+// ─────────────────────────────────────────────────────────
 // Entry in a ternary list.
 // Represents a vector v ∈ {-1,0,+1}^n where n ≤ 128.
 // For n=96 we need 96 bits → 2×uint64.
+//
+// NOTE on `psum`: this field is intentionally kept as a 64-bit value
+// even though weights/target are now ter_u128 (128-bit). It is only
+// ever used as a hash/residue: every matching step in the solver
+// (Level2, Level1, and the candidate pre-filter at the root) inspects
+// psum modulo 2^b for some b<=58, or compares psum for 64-bit
+// equality as a cheap filter. Truncation to the low 64 bits commutes
+// with addition/subtraction mod 2^64, so summing already-truncated
+// 64-bit values yields exactly the correct low 64 bits of the true
+// (arbitrary-width) sum — no precision is lost for matching. The one
+// place that needs the *exact* wide sum — final candidate
+// verification — is done by re-summing the original ter_u128 weights
+// selected by the entry's bit pattern (pos_lo/pos_hi/neg_lo/neg_hi),
+// which is exact regardless of psum's truncation.
+//
+// This keeps TerEntry at 40 bytes and every hot loop (including the
+// GPU kernel) operating on plain 64-bit integers, so there is no
+// performance cost for instances that fit in 64 bits, while instances
+// that don't are still solved correctly via the wide re-verification.
 // ─────────────────────────────────────────────────────────
 struct TerEntry {
-    int64_t  psum;      // partial sum  = <a, v>  (signed, mod 2^64)
+    int64_t  psum;      // low 64 bits of partial sum <a, v> — hash/residue only, see note above
     uint64_t pos_lo;    // bits 0..63:  pos_lo[i]=1 ↔ v[i]=+1
     uint64_t pos_hi;    // bits 64..95: pos_hi[i]=1 ↔ v[i+64]=+1
     uint64_t neg_lo;    // bits 0..63:  neg_lo[i]=1 ↔ v[i]=-1
@@ -81,9 +108,14 @@ struct TerResult {
 // Returns optimal params for given n (uses precomputed or runs optimizer)
 TerParams ter_default_params(int n);
 
-// Main solver entry point
+// Main solver entry point.
+// weights/target are full 128-bit precision (ter_u128) so instances
+// with values or partial sums beyond 2^64 are handled correctly.
+// Internally, instances that actually fit in 64 bits still take the
+// exact same 64-bit hot path as before (see TerEntry note above) —
+// there is no performance penalty for small instances.
 TerResult ter_solve(
-    const std::vector<uint64_t>& weights,
-    uint64_t                     target,
+    const std::vector<ter_u128>& weights,
+    ter_u128                     target,
     const TerParams&             params
 );
