@@ -52,7 +52,11 @@ using ter_u128 = unsigned __int128;
 // that don't are still solved correctly via the wide re-verification.
 // ─────────────────────────────────────────────────────────
 struct TerEntry {
-    int64_t  psum;      // low 64 bits of partial sum <a, v> — hash/residue only, see note above
+    uint64_t psum;      // low 64 bits of partial sum <a, v> — hash/residue only, see note above.
+                         // Unsigned so that the additions performed on it in
+                         // merge_level2/merge_level1/merge_root_and_solve (and
+                         // the GPU kernel) are well-defined wraparound instead
+                         // of signed-overflow UB (Bug 1, see rencana.md §4.1).
     uint64_t pos_lo;    // bits 0..63:  pos_lo[i]=1 ↔ v[i]=+1
     uint64_t pos_hi;    // bits 64..95: pos_hi[i]=1 ↔ v[i+64]=+1
     uint64_t neg_lo;    // bits 0..63:  neg_lo[i]=1 ↔ v[i]=-1
@@ -60,6 +64,25 @@ struct TerEntry {
 };
 // 40 bytes per entry.
 // Constraint: pos_lo & neg_lo == 0, pos_hi & neg_hi == 0
+
+// ─────────────────────────────────────────────────────────
+// Sidecar untuk merge_level1 (rencana.md §5.1 poin 10, langkah 4c).
+// Array kunci uint64 terpisah + bucket table di atas `sorted_C`, supaya
+// pencarian pasangan tidak menyentuh TerEntry 40 B kecuali ada kecocokan
+// kunci. Dibangun ulang tiap panggilan merge_level1 (O(|A|+|B|+|C|)).
+//   c_keys[k] = sorted_C[k].psum & mask_m1        (harus terurut naik)
+//   start[b]  = indeks pertama k dengan (c_keys[k] >> shift) >= b
+//   bucket(req) = req >> shift, shift = b1 - bits, bits = floor(log2 |C|)
+// Hasil pencarian identik dengan binary search penuh (hanya lebih murah).
+// ─────────────────────────────────────────────────────────
+struct Level1Sidecar {
+    std::vector<uint64_t> a_ps;    // psum tiap entri A (urutan sama dengan A)
+    std::vector<uint64_t> b_ps;    // psum tiap entri B (urutan sama dengan B)
+    std::vector<uint64_t> c_keys;  // (psum & mask_m1) tiap entri sorted_C
+    std::vector<uint32_t> start;   // 2^bits + 1 offset bucket
+    int  shift = 0;
+    bool valid = false;
+};
 
 // ─────────────────────────────────────────────────────────
 // Optimal TER parameters for a given n.
@@ -85,7 +108,14 @@ struct TerParams {
     double timeout_seconds;   // 0 = no timeout
     int    fixed_runs;        // if > 0, run exactly this many times (overrides max_restarts)
     bool   verbose;
-    bool   use_gpu;
+
+    // Langkah 4c: pakai sidecar key + bucket lookup di merge_level1 (CPU dan GPU)
+    // menggantikan binary search. Default false = jalur lama (perilaku tidak berubah).
+    bool   use_bucket_lookup;
+    // Langkah 4b: jangan berhenti di solusi pertama; lanjut sampai fixed_runs /
+    // max_restarts / timeout habis dan hitung success rate per run. Diabaikan bila
+    // tidak ada satu pun batas run yang diset (supaya tidak berjalan tanpa akhir).
+    bool   continue_after_found;
 
     // Reconstruct derived params from eps values
     void compute_derived();
@@ -99,6 +129,7 @@ struct TerResult {
     std::vector<size_t> solution_indices;  // 0-indexed positions in weights[]
     int    runs_attempted;
     double elapsed_seconds;
+    int    successful_runs;                // run yang menemukan solusi (>1 hanya bila continue_after_found)
 };
 
 // ─────────────────────────────────────────────────────────
