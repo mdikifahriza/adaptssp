@@ -22,10 +22,10 @@ bool gpu_sort_weights_with_payload(std::vector<uint64_t>& weights, std::vector<s
     uint64_t *d_keys_in = nullptr, *d_keys_out = nullptr, *d_vals_in = nullptr, *d_vals_out = nullptr;
     void* d_temp = nullptr; size_t temp_bytes = 0;
     bool ok = true;
-    ok = ok && cuda_ok2(cudaMalloc(&d_keys_in, n * 8), "malloc keys_in");
-    ok = ok && cuda_ok2(cudaMalloc(&d_keys_out, n * 8), "malloc keys_out");
-    ok = ok && cuda_ok2(cudaMalloc(&d_vals_in, n * 8), "malloc vals_in");
-    ok = ok && cuda_ok2(cudaMalloc(&d_vals_out, n * 8), "malloc vals_out");
+    ok = ok && cuda_ok2(cudaMalloc(reinterpret_cast<void**>(&d_keys_in), n * 8), "malloc keys_in");
+    ok = ok && cuda_ok2(cudaMalloc(reinterpret_cast<void**>(&d_keys_out), n * 8), "malloc keys_out");
+    ok = ok && cuda_ok2(cudaMalloc(reinterpret_cast<void**>(&d_vals_in), n * 8), "malloc vals_in");
+    ok = ok && cuda_ok2(cudaMalloc(reinterpret_cast<void**>(&d_vals_out), n * 8), "malloc vals_out");
     if (!ok) { cudaFree(d_keys_in); cudaFree(d_keys_out); cudaFree(d_vals_in); cudaFree(d_vals_out); return false; }
 
     cudaMemcpy(d_keys_in, weights.data(), n * 8, cudaMemcpyHostToDevice);
