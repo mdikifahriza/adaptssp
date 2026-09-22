@@ -538,8 +538,15 @@ static void merge_level1_cpu_range(
             int tid = omp_get_thread_num();
             if (local_outs[tid].size() >= thread_cap) continue;
             const uint64_t a_base = target_mod - a_ps[i_a];
+            const TerEntry& u = A[i_a];
             for (size_t j = 0; j < nB; ++j) {
                 if (local_outs[tid].size() >= thread_cap) break;
+                const TerEntry& v = B[j];
+                // P6: prefilter bitwise murah SEBELUM bucket lookup — pasangan yang
+                // bit pos-vs-neg-nya bersinggungan pasti gagal check_and_add_ternary,
+                // jadi jangan buang waktu menebak bucket entry yang mustahil valid.
+                if (((u.pos_lo & v.pos_lo) & (u.neg_lo | v.neg_lo)) ||
+                    ((u.pos_hi & v.pos_hi) & (u.neg_hi | v.neg_hi))) continue;
                 const uint64_t req_w = (a_base - b_ps[j]) & mask_m1;
                 const size_t bucket = (size_t)(req_w >> shift);
                 const uint32_t lo = start[bucket], end = start[bucket + 1];
@@ -547,8 +554,6 @@ static void merge_level1_cpu_range(
                 const uint64_t* p = std::lower_bound(keys + lo, keys + end, req_w);
                 size_t k = (size_t)(p - keys);
                 if (k >= end || keys[k] != req_w) continue;
-                const TerEntry& u = A[i_a];
-                const TerEntry& v = B[j];
                 for (; k < end && keys[k] == req_w; ++k) {
                     TerEntry comb;
                     if (check_and_add_ternary(u, v, sorted_C[k], comb)) {
@@ -924,6 +929,18 @@ TerResult ter_solve(
     double sum_l2_avg = 0.0, sum_l1_size = 0.0;
     size_t l2_cap_hits = 0, l1_cap_hits = 0, runs_l1_empty = 0;
 
+    // P6 heartbeat: kalau params.heartbeat_seconds > 0, cetak [TER-HB] berkala.
+    // Dicek saat gabungan jalan (L2/L1/root) — tandanya run TIDAK hang dan bukan
+    // reentrant TTY block. Dipakai juga pas run l1 yang 30-60 s supaya user yakin hidup.
+    double hb_next = 0.0;
+    auto hb_print = [&]() {
+        const double hb_elapsed = secs(t_start, clk::now());
+        std::cout << "[TER-HB] t+" << std::fixed << std::setprecision(1) << hb_elapsed
+                  << "s run=" << run_idx << " dalam progress (L2+L1+root).\n"
+                  << std::defaultfloat;
+        hb_next = hb_elapsed + params.heartbeat_seconds;
+    };
+
     // State pipeline P5: target run berikutnya di-sampling dulu di main thread
     // (RNG tidak thread-safe), lalu bg thread membangun L2nya di buffer lain.
     uint64_t next_s1[3] = {0, 0, 0}, next_s2[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
@@ -999,6 +1016,7 @@ TerResult ter_solve(
         // 3. Build 3 Level 1 lists from Level 2 triplets (C-list sorted by psum & mask_m1).
         //    P4: sort C triplet j+1 dipindah ke background thread SELAGIH GPU mengerjakan
         //    merge triplet j, sehingga sortC tidak lagi serial sebelum merge berikutnya.
+        if (params.heartbeat_seconds > 0.0 && secs(t_start, clk::now()) >= hb_next) hb_print();
         double run_sortc = 0.0, run_l1 = 0.0;
         double bg_sortc = 0.0; // waktu sort yang benar-benar dipakai thread bg (dibaca saat join)
         auto sort_c_fn = [&](std::vector<TerEntry>& v) {

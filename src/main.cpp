@@ -1041,6 +1041,7 @@ int main(int argc, char *argv[])
     double mem_budget_gb = 0.0;
     double ter_cpu_frac = -1.0;
     int ter_b2_extra = 0;
+    double ter_heartbeat_sec = 0.0;
     int extsol_swap_size = 4;
     size_t extsol_max_solutions = 1000;
 
@@ -1118,6 +1119,13 @@ int main(int argc, char *argv[])
               "~4x (kuadratik) tapi L1 makin jarang berisi solusi -> butuh lebih banyak run. "
               "0 (default) = perilaku lama. Untuk eksperimen di Colab.")
         .default_value(0);
+
+    program.add_argument("--ter_heartbeat")
+        .store_into(ter_heartbeat_sec)
+        .help("TER: cetak baris [TER-HB] tiap N detik selama run berjalan (0 = mati). "
+              "Berguna saat --autorestart di Colab tampak hang padahal run l1 lagi "
+              "30-60 s di GPU.")
+        .default_value(0.0);
 
     program.add_argument("--ss_gpu")
         .help("SS: radix-sort quarter2/quarter4 (>65536 elemen) di GPU via cub::DeviceRadixSort, "
@@ -1260,6 +1268,11 @@ int main(int argc, char *argv[])
             params.compute_derived();
             std::cout << "TER: b2_delta=" << ter_b2_extra << " (b1=" << params.b1
                       << ", b2=" << params.b2 << ")\n";
+        }
+        if (ter_heartbeat_sec > 0.0)
+        {
+            params.set_heartbeat(ter_heartbeat_sec);
+            std::cout << "TER: heartbeat tiap " << ter_heartbeat_sec << " s aktif.\n";
         }
         if (program["--ter_stats"] == true)
         {

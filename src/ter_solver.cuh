@@ -128,6 +128,11 @@ struct TerParams {
     int    fixed_runs;        // if > 0, run exactly this many times (overrides max_restarts)
     bool   verbose;
 
+    // P6: heartbeat progres. Kalau > 0, cetak baris [TER-HB] tiap N detik selama
+    // run berjalan (berguna saat --autorestart tampak "hang" karena run l1 30-60 s).
+    // 0 = mati (default akurat).
+    double heartbeat_seconds = 0.0;
+
     // Langkah 4c: pakai sidecar key + bucket lookup di merge_level1 (CPU dan GPU)
     // menggantikan binary search. Default false = jalur lama (perilaku tidak berubah).
     bool   use_bucket_lookup;
@@ -138,6 +143,9 @@ struct TerParams {
 
     // Reconstruct derived params from eps values
     void compute_derived();
+
+    // Set heartbeat interval (detik) — ter_set_heartbeat_seconds.
+    void set_heartbeat(double hb) { heartbeat_seconds = hb; }
 };
 
 // ─────────────────────────────────────────────────────────
