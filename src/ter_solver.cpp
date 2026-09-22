@@ -1044,7 +1044,8 @@ TerResult ter_solve(
 #ifdef WITH_GPU
         {
             const GpuMergeStats g = gpu_merge_stats_get();
-            std::cout << "[TER-PROFIL] GPU (" << g.calls << " panggilan sukses): panggilan pertama=" << g.first_call_ms
+            std::cout << "[TER-PROFIL] GPU (" << g.calls << " panggilan sukses, " << g.pref_calls
+                      << " dari prefetch P3): panggilan pertama=" << g.first_call_ms
                       << " ms (termasuk init konteks CUDA)  alloc=" << g.alloc_ms << "  h2d=" << g.h2d_ms
                       << "  kernel=" << g.kernel_ms << "  d2h=" << g.d2h_ms << "  wait=" << g.wait_ms << " ms total\n";
         }
