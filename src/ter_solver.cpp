@@ -97,7 +97,6 @@ inline bool check_root_sum(
 // Optimal parameter defaults from Paper (Information 2025, Li et al.)
 // ─────────────────────────────────────────────────────────
 void TerParams::compute_derived() {
-    w1 = eps11 + 2.0 * eps01;
     w2 = eps11 / 3.0 + 2.0 * eps01 / 3.0 + eps22 + eps12 + 2.0 * eps02;
 
     l1 = 0.2221;
@@ -106,10 +105,40 @@ void TerParams::compute_derived() {
     r1 = 1.1473 * 0.5;
     r2 = 0.3396 * 0.5;
 
-    // Bit matching constraints:
-    b2 = std::max(1, std::min(28, (int)std::floor(r2 * n)));
-    b1 = std::max(b2 + 2, std::min(58, (int)std::floor(r1 * n)));
-    b3 = 0;
+    // Target list sizes per level, with a hard safety floor for small n so
+    // the meet-in-middle / ternary merges always have enough candidates to
+    // work with. Computed ONCE here (rather than re-derived independently
+    // in ter_solve()) so b1/b2 below can be kept consistent with whatever
+    // sizes actually end up being used.
+    target_L3 = std::max((size_t)4096, (size_t)std::pow(2.0, l3 * n));
+    target_L2 = std::max((size_t)8192, (size_t)std::pow(2.0, l2 * n));
+    target_L1 = std::max((size_t)8192, (size_t)std::pow(2.0, l1 * n));
+
+    // How far the floor pushed each level's size above its theoretical
+    // 2^(l*n) size, in bits (log2). Zero whenever the floor isn't active
+    // (e.g. n=96, where target_L3=358397 is already far above the 4096
+    // floor) — so everything below reduces exactly to the old formula for
+    // instances the floor doesn't touch.
+    const double delta_L3 = std::log2((double)target_L3) - l3 * n;
+    const double delta_L2 = std::log2((double)target_L2) - l2 * n;
+    const double delta_L1 = std::log2((double)target_L1) - l1 * n;
+
+    // Bit matching constraints. b2 matches 2 pools of size target_L3 down to
+    // target_L2 (level-3 -> level-2 MITM merge: expected survivors ~
+    // target_L3^2 / 2^b2); b1 matches 3 lists of size target_L2 down to
+    // target_L1 (level-2 -> level-1 ternary merge: expected survivors ~
+    // target_L2^3 / 2^b1). r1*n and r2*n are calibrated against the
+    // *theoretical* (unfloored) sizes 2^(l*n); when the small-n floor bumps
+    // a level's actual size up by delta bits, the matching-bit count has to
+    // grow by that same multiple (2x for the two pools feeding b2, 3x for
+    // the three lists feeding b1) to keep the expected survivor count at
+    // the next level unchanged. Previously b1/b2 were computed straight
+    // from r1*n/r2*n with no such correction, so for small n (where the
+    // floor is active) they came out far too small relative to the actual
+    // (floor-inflated) pool sizes, and merge_level2/merge_level1 would
+    // constantly hit their output caps (Bug #2).
+    b2 = std::max(1, std::min(28, (int)std::lround(r2 * n + 2.0 * delta_L3 - delta_L2)));
+    b1 = std::max(b2 + 2, std::min(58, (int)std::lround(r1 * n + 3.0 * delta_L2 - delta_L1)));
 }
 
 TerParams ter_default_params(int n) {
@@ -525,7 +554,13 @@ static void merge_level1(
         size_t cpu_rows = (size_t)(frac * (double)total);
         size_t gpu_rows = total - cpu_rows;
 
-        bool launched = gpu_rows > 0 && gpu_l1_launch(A, B, sorted_C, target_mod, mask_m1, max_cap, sc_ok ? &sc : nullptr, 256);
+        // PENTING: a_count=gpu_rows membatasi GPU ke A[0..gpu_rows) saja, sesuai jatah
+        // yang dipakai merge_level1_cpu_range di bawah untuk sisanya (A[gpu_rows..total)).
+        // Sebelumnya param ini tidak ada, gpu_l1_launch selalu memproses SELURUH A --
+        // untuk n besar ini membuat grid CUDA meledak (>2^31-1 blok) dan launch selalu
+        // gagal (fallback penuh ke CPU), dan kalaupun grid-nya masih di bawah batas,
+        // baris [gpu_rows, total) akan diproses dobel oleh CPU & GPU.
+        bool launched = gpu_rows > 0 && gpu_l1_launch(A, B, sorted_C, target_mod, mask_m1, max_cap, sc_ok ? &sc : nullptr, 256, gpu_rows);
         if (gpu_rows > 0 && !launched) {
             if (++stats.gpu_fallbacks == 1)
                 std::cerr << "[TER] PERINGATAN: gpu_l1_launch gagal, jalur CPU penuh dipakai.\n";
@@ -715,9 +750,12 @@ TerResult ter_solve(
     int n = params.n;
     int n_half = n / 2;
 
-    size_t target_L3 = std::max((size_t)4096, (size_t)std::pow(2.0, params.l3 * n));
-    size_t target_L2 = std::max((size_t)8192, (size_t)std::pow(2.0, params.l2 * n));
-    size_t target_L1 = std::max((size_t)8192, (size_t)std::pow(2.0, params.l1 * n));
+    // NOTE: target_L3/L2/L1 (incl. the small-n safety floor) are computed
+    // once in TerParams::compute_derived(), together with b1/b2, so the two
+    // stay mutually consistent (Bug #2 fix) — do not recompute them here.
+    size_t target_L3 = params.target_L3;
+    size_t target_L2 = params.target_L2;
+    size_t target_L1 = params.target_L1;
     const size_t l2_cap = target_L2 * 2;
     const size_t l1_cap = target_L1 * 2;
 

@@ -179,16 +179,26 @@ void gpu_l1_abort() {
 
 bool gpu_l1_launch(const std::vector<TerEntry>& A, const std::vector<TerEntry>& B,
                    const std::vector<TerEntry>& sorted_C, uint64_t target_mod, uint64_t mask_m1,
-                   size_t max_cap, const Level1Sidecar* sidecar, int block_size)
+                   size_t max_cap, const Level1Sidecar* sidecar, int block_size, size_t a_count)
 {
     if (A.empty() || B.empty() || sorted_C.empty()) return false;
+    if (a_count == (size_t)-1 || a_count > A.size()) a_count = A.size();
+    if (a_count == 0) return false;
     if (g.pending) gpu_l1_abort();
     const auto t0 = clk::now();
     if (!session_init()) return false;
 
-    if (A.size() > SIZE_MAX / B.size()) { std::cerr << "[GPU] |A|*|B| overflow\n"; return false; }
+    // NOTE (Bug fix): hanya A[0..a_count) yang dikirim ke GPU -- ini HARUS sama
+    // dengan `gpu_rows` yang dipakai caller (merge_level1 di ter_solver.cpp) untuk
+    // menghitung jatah baris CPU (A[a_count..A.size())), atau baris yang sama akan
+    // diproses dobel oleh CPU dan GPU sekaligus. Sebelumnya fungsi ini selalu memakai
+    // A.size() penuh, sehingga total_pairs/grid dihitung dari SELURUH A meski hanya
+    // sebagian yang seharusnya jadi jatah GPU -- untuk n besar (mis. n=96, |A|~1.6M)
+    // ini membuat grid meledak jauh di atas batas CUDA (2^31-1) dan launch selalu
+    // gagal, sehingga GPU tidak pernah benar-benar terpakai.
+    if (a_count > SIZE_MAX / B.size()) { std::cerr << "[GPU] |A|*|B| overflow\n"; return false; }
     if (block_size < 32 || block_size > 1024 || (block_size % 32) != 0) block_size = 256;
-    const size_t total_pairs = A.size() * B.size();
+    const size_t total_pairs = a_count * B.size();
     const size_t grid = (total_pairs + (size_t)block_size - 1) / (size_t)block_size;
     if (grid > 2147483647ULL) { std::cerr << "[GPU] grid terlalu besar (" << grid << " blok)\n"; return false; }
 
@@ -196,9 +206,9 @@ bool gpu_l1_launch(const std::vector<TerEntry>& A, const std::vector<TerEntry>& 
                          sidecar->b_ps.size() == B.size() && sidecar->c_keys.size() == sorted_C.size() &&
                          !sidecar->start.empty());
 
-    const size_t bA = A.size() * sizeof(TerEntry), bB = B.size() * sizeof(TerEntry), bC = sorted_C.size() * sizeof(TerEntry);
+    const size_t bA = a_count * sizeof(TerEntry), bB = B.size() * sizeof(TerEntry), bC = sorted_C.size() * sizeof(TerEntry);
     const size_t bOut = max_cap * sizeof(TerEntry);
-    const size_t bAps = A.size() * 8, bBps = B.size() * 8, bCk = sorted_C.size() * 8;
+    const size_t bAps = a_count * 8, bBps = B.size() * 8, bCk = sorted_C.size() * 8;
     const size_t bSt = bucket ? sidecar->start.size() * 4 : 0;
 
     const auto ta = clk::now();
@@ -211,6 +221,8 @@ bool gpu_l1_launch(const std::vector<TerEntry>& A, const std::vector<TerEntry>& 
     }
     g.stats.alloc_ms += ms_since(ta, clk::now());
 
+    // A dan a_ps dipotong ke a_count baris pertama (jatah GPU); B dan sorted_C tetap utuh
+    // karena keduanya dipakai penuh baik oleh GPU maupun jatah CPU (lihat merge_level1).
     std::memcpy(g.hA.p, A.data(), bA);
     std::memcpy(g.hB.p, B.data(), bB);
     std::memcpy(g.hC.p, sorted_C.data(), bC);
@@ -239,12 +251,12 @@ bool gpu_l1_launch(const std::vector<TerEntry>& A, const std::vector<TerEntry>& 
     auto* dCnt = static_cast<unsigned long long*>(g.dCnt.p);
     if (bucket) {
         level1_merge_kernel_bucket<<<(unsigned)grid, (unsigned)block_size, 0, s>>>(
-            (const TerEntry*)g.dA.p, A.size(), (const TerEntry*)g.dB.p, B.size(), (const TerEntry*)g.dC.p,
+            (const TerEntry*)g.dA.p, a_count, (const TerEntry*)g.dB.p, B.size(), (const TerEntry*)g.dC.p,
             (const uint64_t*)g.dAps.p, (const uint64_t*)g.dBps.p, (const uint64_t*)g.dCk.p, (const uint32_t*)g.dSt.p,
             sidecar->shift, target_mod, mask_m1, dOut, dCnt, max_cap);
     } else {
         level1_merge_kernel<<<(unsigned)grid, (unsigned)block_size, 0, s>>>(
-            (const TerEntry*)g.dA.p, A.size(), (const TerEntry*)g.dB.p, B.size(), (const TerEntry*)g.dC.p, sorted_C.size(),
+            (const TerEntry*)g.dA.p, a_count, (const TerEntry*)g.dB.p, B.size(), (const TerEntry*)g.dC.p, sorted_C.size(),
             target_mod, mask_m1, dOut, dCnt, max_cap);
     }
     if (!cuda_ok(cudaGetLastError(), "kernel launch")) return false;

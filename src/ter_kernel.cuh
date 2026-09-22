@@ -15,9 +15,13 @@ GpuMergeStats gpu_merge_stats_get();
 void gpu_merge_stats_reset();
 
 // Async: launch mengembalikan segera; finish menunggu dan menyalin hasil. Satu job in-flight.
+// a_count: jumlah baris A[0..a_count) yang diproses GPU (bagian awal A); sisanya
+// A[a_count..A.size()) adalah jatah CPU (lihat merge_level1 di ter_solver.cpp). Wajib
+// <= A.size(); default A.size() untuk kompatibilitas caller yang memproses seluruh A.
 bool gpu_l1_launch(const std::vector<TerEntry>& A, const std::vector<TerEntry>& B,
                    const std::vector<TerEntry>& sorted_C, uint64_t target_mod, uint64_t mask_m1,
-                   size_t max_cap, const Level1Sidecar* sidecar, int block_size);
+                   size_t max_cap, const Level1Sidecar* sidecar, int block_size,
+                   size_t a_count = (size_t)-1);
 bool gpu_l1_finish(std::vector<TerEntry>& L1_out);
 void gpu_l1_abort();
 void gpu_l1_release();
