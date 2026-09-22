@@ -1219,7 +1219,7 @@ int main(int argc, char *argv[])
     if (solver == "ter")
     {
         std::cout << "[TER] Menggunakan TER Solver (Yang Li et al., 2025)\n";
-        TerParams params = ter_default_params((int)instance_1d.values.size());
+        TerParams params = ter_default_params(instance_1d.values);
         params.fixed_runs = runs;
         params.timeout_seconds = timeout_sec;
         if (program["--autorestart"] == true)

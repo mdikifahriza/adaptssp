@@ -96,6 +96,17 @@ inline bool check_root_sum(
 // ─────────────────────────────────────────────────────────
 // Optimal parameter defaults from Paper (Information 2025, Li et al.)
 // ─────────────────────────────────────────────────────────
+// Number of bits needed to represent v (i.e. floor(log2(v))+1, 0 for v==0).
+// Exact integer bit-width, done by hand instead of std::log2 because
+// total_weight_sum is a 128-bit value and log2() on a double silently
+// loses precision above 2^53 — fine for picking a rough magnitude, not
+// fine for a bit count we're about to use as a hard clamp.
+static int bit_width_u128(ter_u128 v) {
+    int bits = 0;
+    while (v) { v >>= 1; ++bits; }
+    return bits;
+}
+
 void TerParams::compute_derived() {
     w2 = eps11 / 3.0 + 2.0 * eps01 / 3.0 + eps22 + eps12 + 2.0 * eps02;
 
@@ -137,13 +148,54 @@ void TerParams::compute_derived() {
     // floor is active) they came out far too small relative to the actual
     // (floor-inflated) pool sizes, and merge_level2/merge_level1 would
     // constantly hit their output caps (Bug #2).
-    b2 = std::max(1, std::min(28, (int)std::lround(r2 * n + 2.0 * delta_L3 - delta_L2)));
-    b1 = std::max(b2 + 2, std::min(58, (int)std::lround(r1 * n + 3.0 * delta_L2 - delta_L1)));
+    int b2_raw = std::max(1, std::min(28, (int)std::lround(r2 * n + 2.0 * delta_L3 - delta_L2)));
+    int b1_raw = std::max(b2_raw + 2, std::min(58, (int)std::lround(r1 * n + 3.0 * delta_L2 - delta_L1)));
+
+    // Adaptive clamp (Bug #3 fix): b1/b2 must never ask for more bits of
+    // psum than this SPECIFIC instance's weights can actually produce.
+    // psum values are sums of signed selections of the original weights,
+    // so no partial sum can exceed +-total_weight_sum in magnitude; that
+    // range needs at most usable_bits = bit_width(2*total_weight_sum+1)
+    // bits to represent uniquely. Sampling/matching residues in a wider
+    // space than that (what the pre-clamp b1/b2 above do for small n,
+    // where the floor on target_L1/L2/L3 dominates and inflates delta_*)
+    // means the uniformly-sampled residue almost never lands in the thin
+    // slice of the space the real data actually occupies -> matches
+    // become astronomically rare (observed as merges stuck at (0,0,0)).
+    //
+    // This is intentionally driven by the instance's actual magnitude,
+    // not by n or any hardcoded n-range: two instances with the same n
+    // but different weight scales get different clamps, and the same
+    // instance always gets a clamp consistent with itself. When
+    // total_weight_sum is 0 (unset / legacy caller), usable_bits is left
+    // at its max (128) so the clamp is a no-op and behavior is unchanged.
+    int usable_bits = (total_weight_sum == 0)
+        ? 128
+        : bit_width_u128(2 * total_weight_sum + 1);
+
+    b2 = std::max(1, std::min(b2_raw, usable_bits));
+    b1 = std::max(b2 + 2, std::min(b1_raw, usable_bits));
 }
 
-TerParams ter_default_params(int n) {
+TerParams ter_default_params(const std::vector<ter_u128>& weights) {
     TerParams p{};
-    p.n = n;
+    p.n = (int)weights.size();
+
+    // Sum the actual instance weights (full 128-bit precision) so
+    // compute_derived() below can clamp b1/b2 to what this specific
+    // instance can produce, instead of guessing from n alone. Weights
+    // here are the original (non-negative) instance values, so this is
+    // directly Σ|w_i|. Saturate instead of wrapping in the (extreme,
+    // essentially never hit in practice) case the sum would overflow
+    // 128 bits, since compute_derived() only cares about its bit-width.
+    ter_u128 sum = 0;
+    for (ter_u128 w : weights) {
+        ter_u128 next = sum + w;
+        if (next < sum) { sum = ~(ter_u128)0; break; } // overflow -> saturate
+        sum = next;
+    }
+    p.total_weight_sum = sum;
+
     p.eps01 = 0.0066;
     p.eps11 = 0.0024;
     p.eps02 = 0.0004;

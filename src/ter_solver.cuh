@@ -90,6 +90,16 @@ struct Level1Sidecar {
 // ─────────────────────────────────────────────────────────
 struct TerParams {
     int    n;          // instance size
+
+    // Total magnitude of the actual instance weights (sum of all |w_i|,
+    // full 128-bit precision). Set by ter_default_params() from the real
+    // weights BEFORE compute_derived() runs. This is what makes the
+    // b1/b2 clamp below adaptive to the instance itself rather than to a
+    // hardcoded n range: two instances with the same n but very
+    // different weight magnitudes get different, correctly-sized clamps.
+    // Zero means "unknown" (e.g. legacy callers) and disables the clamp.
+    ter_u128 total_weight_sum = 0;
+
     double eps11;      // ε(1)_1 : frac 1-coords with rep type 1+1+(-1) at level 1
     double eps01;      // ε(1)_0 : frac 0-coords with non-trivial rep at level 1
     double eps12;      // ε(2)_1 : frac 1-coords with rep type 1+1+(-1) at level 2
@@ -102,6 +112,8 @@ struct TerParams {
     double l1, l2, l3; // log2(list size) / n per level
     double r1, r2;     // log2(representations) / n per level
     int    b1, b2, b3; // bits matched at level 1, 2, 3 merge
+    size_t target_L3, target_L2, target_L1; // actual target list sizes per level
+                                              // (floored versions of 2^(l*n); see compute_derived())
 
     // Solver behavior
     int    max_restarts;      // 0 = infinite until timeout
@@ -136,8 +148,12 @@ struct TerResult {
 // Public API
 // ─────────────────────────────────────────────────────────
 
-// Returns optimal params for given n (uses precomputed or runs optimizer)
-TerParams ter_default_params(int n);
+// Returns optimal params for the given instance. Takes the actual weights
+// (not just n) so total_weight_sum can be filled in and used by
+// compute_derived() to adaptively clamp b1/b2 to the instance's real
+// magnitude — see the comment on TerParams::total_weight_sum and on
+// compute_derived() for why this matters.
+TerParams ter_default_params(const std::vector<ter_u128>& weights);
 
 // Main solver entry point.
 // weights/target are full 128-bit precision (ter_u128) so instances
