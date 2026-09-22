@@ -143,9 +143,6 @@ struct TerParams {
 
     // Reconstruct derived params from eps values
     void compute_derived();
-
-    // Set heartbeat interval (detik) — ter_set_heartbeat_seconds.
-    void set_heartbeat(double hb) { heartbeat_seconds = hb; }
 };
 
 // ─────────────────────────────────────────────────────────

@@ -1271,7 +1271,7 @@ int main(int argc, char *argv[])
         }
         if (ter_heartbeat_sec > 0.0)
         {
-            params.set_heartbeat(ter_heartbeat_sec);
+            params.heartbeat_seconds = ter_heartbeat_sec;
             std::cout << "TER: heartbeat tiap " << ter_heartbeat_sec << " s aktif.\n";
         }
         if (program["--ter_stats"] == true)
