@@ -897,8 +897,20 @@ TerResult ter_solve(
     std::mt19937_64 rng(1337);
     int run_idx = 0;
 
+    // s1/s2 adalah residu mod 2^b1/2^b2 (b1<=58, b2<=28), jadi hanya low-64
+    // bit target yang dipakai; mask & target_lo64 loop-invariant (params tetap).
+    const uint64_t mask_m1 = (1ULL << params.b1) - 1ULL;
+    const uint64_t mask_m2 = (1ULL << params.b2) - 1ULL;
+    const uint64_t target_lo64 = lo64(target);
+
+    // P5: double buffer L2 untuk pipeline antar-run. Saat GPU mengerjakan
+    // merge_level1 run k (30-60 s di n=96), background thread membangun 9 list
+    // L2 run k+1 di buffer cadangan — CPU yang tadinya idle jadi terpakai.
+    std::vector<std::vector<TerEntry>> L2buf[2];
+    for (auto& b : L2buf) b.resize(9);
+    int cur_buf = 0;
+
     // PERF: persistent scratch buffers reused across restarts.
-    std::vector<std::vector<TerEntry>> L2(9);
     std::vector<std::vector<TerEntry>> L1(3);
     std::vector<std::vector<TerEntry>> level1_scratch[3];  // one local_outs_scratch per L1 slot
     for (int j = 0; j < 3; ++j) level1_scratch[j].resize(omp_get_max_threads());
@@ -912,6 +924,31 @@ TerResult ter_solve(
     double sum_l2_avg = 0.0, sum_l1_size = 0.0;
     size_t l2_cap_hits = 0, l1_cap_hits = 0, runs_l1_empty = 0;
 
+    // State pipeline P5: target run berikutnya di-sampling dulu di main thread
+    // (RNG tidak thread-safe), lalu bg thread membangun L2nya di buffer lain.
+    uint64_t next_s1[3] = {0, 0, 0}, next_s2[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    bool have_pipelined = false;
+    std::thread bg_l2;
+    bool bg_l2_running = false;
+    double bg_l2_time = 0.0;
+
+    // Join thread pembangun L2 run berikutnya (dipanggil sebelum semua jalur keluar
+    // loop, agar std::thread tidak di-destruksi dalam state joinable -> std::terminate).
+    auto join_l2_bg = [&]() {
+        if (bg_l2_running) { bg_l2.join(); bg_l2_running = false; }
+    };
+
+    auto sample_s12 = [&](uint64_t* s1, uint64_t* s2) {
+        s1[0] = rng() & mask_m1;
+        s1[1] = rng() & mask_m1;
+        s1[2] = (target_lo64 - s1[0] - s1[1]) & mask_m1;
+        for (int k = 0; k < 3; ++k) {
+            s2[3 * k + 0] = rng() & mask_m2;
+            s2[3 * k + 1] = rng() & mask_m2;
+            s2[3 * k + 2] = (s1[k] - s2[3 * k + 0] - s2[3 * k + 1]) & mask_m2;
+        }
+    };
+
     while (true) {
         run_idx++;
         result.runs_attempted = run_idx;
@@ -919,31 +956,45 @@ TerResult ter_solve(
         auto run_start = clk::now();
 
         // 1. Sample random targets s^(1)_k and s^(2)_m
-        uint64_t mask_m1 = (1ULL << params.b1) - 1ULL;
-        uint64_t mask_m2 = (1ULL << params.b2) - 1ULL;
-
-        // s1/s2 are residues mod 2^b1 / 2^b2 (b1<=58, b2<=28), so only
-        // target's low 64 bits are ever needed here — see TerEntry note.
-        uint64_t target_lo64 = lo64(target);
-
-        uint64_t s1[3];
-        s1[0] = rng() & mask_m1;
-        s1[1] = rng() & mask_m1;
-        s1[2] = (target_lo64 - s1[0] - s1[1]) & mask_m1;
-
-        uint64_t s2[9];
-        for (int k = 0; k < 3; ++k) {
-            s2[3 * k + 0] = rng() & mask_m2;
-            s2[3 * k + 1] = rng() & mask_m2;
-            s2[3 * k + 2] = (s1[k] - s2[3 * k + 0] - s2[3 * k + 1]) & mask_m2;
+        uint64_t s1[3], s2[9];
+        double run_l2 = 0.0;
+        if (have_pipelined) {
+            // L2 run ini sudah dibangun bg thread selama run sebelumnya — tinggal pakai.
+            cur_buf = 1 - cur_buf;
+            if (bg_l2_running) { bg_l2.join(); bg_l2_running = false; }
+            std::memcpy(s1, next_s1, sizeof(s1));
+            std::memcpy(s2, next_s2, sizeof(s2));
+            run_l2 = bg_l2_time;
+            have_pipelined = false;
+        } else {
+            // Run pertama: bangun L2 sinkron.
+            sample_s12(s1, s2);
+            const auto p_l2_0 = clk::now();
+            for (int m = 0; m < 9; ++m) {
+                merge_level2(pool_left, sorted_pool_right, sorted_right_keys, s2[m], params.b2, l2_cap, L2buf[cur_buf][m]);
+            }
+            run_l2 = secs(p_l2_0, clk::now());
         }
 
-        // 2. Build 9 Level 2 lists from base pool (pool_right pre-sorted once above)
-        const auto p_l2_0 = clk::now();
-        for (int m = 0; m < 9; ++m) {
-            merge_level2(pool_left, sorted_pool_right, sorted_right_keys, s2[m], params.b2, l2_cap, L2[m]);
+        // 2. Pipeline: bangun L2 run BERIKUTNYA di background (buffer cadangan)
+        //    sambil GPU mengerjakan merge L1 run ini. Target run berikutnya
+        //    (s1/s2) di-sampling di sini (main thread) supaya RNG aman.
+        const bool may_continue =
+            !(params.fixed_runs > 0 && run_idx >= params.fixed_runs) &&
+            !(params.max_restarts > 0 && run_idx > params.max_restarts) &&
+            !(params.timeout_seconds > 0.0 && secs(t_start, clk::now()) >= params.timeout_seconds);
+        if (may_continue) {
+            sample_s12(next_s1, next_s2);
+            int nb = 1 - cur_buf;
+            bg_l2 = std::thread([&] {
+                const auto t0 = clk::now();
+                for (int m = 0; m < 9; ++m)
+                    merge_level2(pool_left, sorted_pool_right, sorted_right_keys, next_s2[m], params.b2, l2_cap, L2buf[nb][m]);
+                bg_l2_time = secs(t0, clk::now());
+            });
+            bg_l2_running = true;
+            have_pipelined = true;
         }
-        const double run_l2 = secs(p_l2_0, clk::now());
 
         // 3. Build 3 Level 1 lists from Level 2 triplets (C-list sorted by psum & mask_m1).
         //    P4: sort C triplet j+1 dipindah ke background thread SELAGIH GPU mengerjakan
@@ -958,7 +1009,7 @@ TerResult ter_solve(
             bg_sortc += secs(s0, clk::now());
         };
         // Triplet 0: C disortir langsung (tidak ada merge sebelumnya yang bisa menampung).
-        sort_c_fn(L2[2]);
+        sort_c_fn(L2buf[cur_buf][2]);
         run_sortc += bg_sortc; bg_sortc = 0.0;
 
         std::thread bg_sort;
@@ -968,10 +1019,10 @@ TerResult ter_solve(
             // overlap); sekaligus mencatat seberapa lama sortC yang tidak bisa disembunyikan.
             if (bg_active) { bg_sort.join(); bg_active = false; run_sortc += bg_sortc; bg_sortc = 0.0; }
             // Launch sort C triplet j+1 di background: berjalan selama merge_level1(j) di GPU.
-            if (j + 1 < 3) { bg_sort = std::thread(sort_c_fn, std::ref(L2[3 * (j + 1) + 2])); bg_active = true; }
+            if (j + 1 < 3) { bg_sort = std::thread(sort_c_fn, std::ref(L2buf[cur_buf][3 * (j + 1) + 2])); bg_active = true; }
             const auto a1 = clk::now();
             merge_level1(
-                L2[3 * j + 0], L2[3 * j + 1], L2[3 * j + 2],
+                L2buf[cur_buf][3 * j + 0], L2buf[cur_buf][3 * j + 1], L2buf[cur_buf][3 * j + 2],
                 s1[j], params.b1, l1_cap, L1[j],
                 level1_scratch[j],
                 params.use_bucket_lookup, sidecar, l1_stats
@@ -993,15 +1044,15 @@ TerResult ter_solve(
 
         // Akumulasi profil
         tot_l2 += run_l2; tot_sortc += run_sortc; tot_l1 += run_l1; tot_root += run_root;
-        sum_l2_avg += (double)(L2[0].size() + L2[1].size() + L2[2].size()) / 3.0;
+        sum_l2_avg += (double)(L2buf[cur_buf][0].size() + L2buf[cur_buf][1].size() + L2buf[cur_buf][2].size()) / 3.0;
         sum_l1_size += (double)(L1[0].size() + L1[1].size() + L1[2].size());
-        for (int m = 0; m < 9; ++m) if (L2[m].size() >= l2_cap) ++l2_cap_hits;
+        for (int m = 0; m < 9; ++m) if (L2buf[cur_buf][m].size() >= l2_cap) ++l2_cap_hits;
         for (int j = 0; j < 3; ++j) if (L1[j].size() >= l1_cap) ++l1_cap_hits;
         if (L1[0].empty() || L1[1].empty() || L1[2].empty()) ++runs_l1_empty;
 
         if (params.verbose) {
             std::cout << "[Run " << run_idx << "] L2 avg="
-                      << (L2[0].size() + L2[1].size() + L2[2].size()) / 3
+                      << (L2buf[cur_buf][0].size() + L2buf[cur_buf][1].size() + L2buf[cur_buf][2].size()) / 3
                       << ", L1=(" << L1[0].size() << ", " << L1[1].size() << ", " << L1[2].size() << ")"
                       << ", elapsed=" << run_sec << "s (total=" << total_sec << "s)"
                       << std::fixed << std::setprecision(1)
@@ -1018,13 +1069,13 @@ TerResult ter_solve(
                 result.found = true;
                 result.solution_indices = sol;
             }
-            if (!keep_going) break;
+            if (!keep_going) { join_l2_bg(); break; }
         }
 
         // Stop conditions
-        if (params.fixed_runs > 0 && run_idx >= params.fixed_runs) break;
-        if (params.max_restarts > 0 && run_idx > params.max_restarts) break;
-        if (params.timeout_seconds > 0.0 && total_sec >= params.timeout_seconds) break;
+        if (params.fixed_runs > 0 && run_idx >= params.fixed_runs) { join_l2_bg(); break; }
+        if (params.max_restarts > 0 && run_idx > params.max_restarts) { join_l2_bg(); break; }
+        if (params.timeout_seconds > 0.0 && total_sec >= params.timeout_seconds) { join_l2_bg(); break; }
     }
 
     auto t_end = clk::now();
