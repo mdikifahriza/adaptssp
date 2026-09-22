@@ -15,8 +15,10 @@
 #include <cstring>
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <iomanip>
 #include <omp.h>
+#include <thread>
 
 // ─────────────────────────────────────────────────────────
 // Print a ter_u128 value (no built-in operator<< for __int128).
@@ -944,24 +946,40 @@ TerResult ter_solve(
         const double run_l2 = secs(p_l2_0, clk::now());
 
         // 3. Build 3 Level 1 lists from Level 2 triplets (C-list sorted by psum & mask_m1).
+        //    P4: sort C triplet j+1 dipindah ke background thread SELAGIH GPU mengerjakan
+        //    merge triplet j, sehingga sortC tidak lagi serial sebelum merge berikutnya.
         double run_sortc = 0.0, run_l1 = 0.0;
-        for (int j = 0; j < 3; ++j) {
-            auto& C = L2[3 * j + 2];
-            const auto a0 = clk::now();
-            std::sort(C.begin(), C.end(), [mask_m1](const TerEntry& x, const TerEntry& y) {
+        double bg_sortc = 0.0; // waktu sort yang benar-benar dipakai thread bg (dibaca saat join)
+        auto sort_c_fn = [&](std::vector<TerEntry>& v) {
+            const auto s0 = clk::now();
+            std::sort(v.begin(), v.end(), [mask_m1](const TerEntry& x, const TerEntry& y) {
                 return ((uint64_t)x.psum & mask_m1) < ((uint64_t)y.psum & mask_m1);
             });
+            bg_sortc += secs(s0, clk::now());
+        };
+        // Triplet 0: C disortir langsung (tidak ada merge sebelumnya yang bisa menampung).
+        sort_c_fn(L2[2]);
+        run_sortc += bg_sortc; bg_sortc = 0.0;
+
+        std::thread bg_sort;
+        bool bg_active = false;
+        for (int j = 0; j < 3; ++j) {
+            // join thread yang menyortir C untuk triplet j (dilaunch saat merge j-1 boolean
+            // overlap); sekaligus mencatat seberapa lama sortC yang tidak bisa disembunyikan.
+            if (bg_active) { bg_sort.join(); bg_active = false; run_sortc += bg_sortc; bg_sortc = 0.0; }
+            // Launch sort C triplet j+1 di background: berjalan selama merge_level1(j) di GPU.
+            if (j + 1 < 3) { bg_sort = std::thread(sort_c_fn, std::ref(L2[3 * (j + 1) + 2])); bg_active = true; }
             const auto a1 = clk::now();
             merge_level1(
-                L2[3 * j + 0], L2[3 * j + 1], C,
+                L2[3 * j + 0], L2[3 * j + 1], L2[3 * j + 2],
                 s1[j], params.b1, l1_cap, L1[j],
                 level1_scratch[j],
                 params.use_bucket_lookup, sidecar, l1_stats
             );
             const auto a2 = clk::now();
-            run_sortc += secs(a0, a1);
             run_l1 += secs(a1, a2);
         }
+        if (bg_active) { bg_sort.join(); bg_active = false; run_sortc += bg_sortc; bg_sortc = 0.0; }
 
         // 4. Root search
         std::vector<size_t> sol;
