@@ -242,6 +242,112 @@ static void generate_half_base_pool(
             if (pool.size() >= target_size * 2) break;
         }
     }
+
+    // 0 ones, 1 minus-one
+    if (pool.size() < target_size) {
+        for (int i = 0; i < count; ++i) {
+            int idx_neg = start_idx + i;
+            TerEntry e{};
+            if (idx_neg < 64) e.neg_lo = (1ULL << idx_neg);
+            else e.neg_hi = (1ULL << (idx_neg - 64));
+            e.psum = 0ULL - lo64(weights[idx_neg]);
+            pool.push_back(e);
+        }
+    }
+
+    // 0 ones, 2 minus-ones
+    if (pool.size() < target_size) {
+        for (int i = 0; i < count; ++i) {
+            int n1 = start_idx + i;
+            for (int j = i + 1; j < count; ++j) {
+                int n2 = start_idx + j;
+                TerEntry e{};
+                if (n1 < 64) e.neg_lo |= (1ULL << n1);
+                else e.neg_hi |= (1ULL << (n1 - 64));
+                if (n2 < 64) e.neg_lo |= (1ULL << n2);
+                else e.neg_hi |= (1ULL << (n2 - 64));
+                e.psum = 0ULL - (lo64(weights[n1]) + lo64(weights[n2]));
+                pool.push_back(e);
+            }
+        }
+    }
+
+    // 0 ones, 3 minus-ones
+    if (pool.size() < target_size) {
+        for (int i = 0; i < count; ++i) {
+            int n1 = start_idx + i;
+            for (int j = i + 1; j < count; ++j) {
+                int n2 = start_idx + j;
+                for (int k = j + 1; k < count; ++k) {
+                    int n3 = start_idx + k;
+                    TerEntry e{};
+                    if (n1 < 64) e.neg_lo |= (1ULL << n1); else e.neg_hi |= (1ULL << (n1 - 64));
+                    if (n2 < 64) e.neg_lo |= (1ULL << n2); else e.neg_hi |= (1ULL << (n2 - 64));
+                    if (n3 < 64) e.neg_lo |= (1ULL << n3); else e.neg_hi |= (1ULL << (n3 - 64));
+                    e.psum = 0ULL - (lo64(weights[n1]) + lo64(weights[n2]) + lo64(weights[n3]));
+                    pool.push_back(e);
+                    if (pool.size() >= target_size * 2) break;
+                }
+                if (pool.size() >= target_size * 2) break;
+            }
+            if (pool.size() >= target_size * 2) break;
+        }
+    }
+
+    // 4 ones, 0 minus-ones
+    if (pool.size() < target_size) {
+        for (int i = 0; i < count; ++i) {
+            int idx1 = start_idx + i;
+            for (int j = i + 1; j < count; ++j) {
+                int idx2 = start_idx + j;
+                for (int k = j + 1; k < count; ++k) {
+                    int idx3 = start_idx + k;
+                    for (int l = k + 1; l < count; ++l) {
+                        int idx4 = start_idx + l;
+                        TerEntry e{};
+                        if (idx1 < 64) e.pos_lo |= (1ULL << idx1); else e.pos_hi |= (1ULL << (idx1 - 64));
+                        if (idx2 < 64) e.pos_lo |= (1ULL << idx2); else e.pos_hi |= (1ULL << (idx2 - 64));
+                        if (idx3 < 64) e.pos_lo |= (1ULL << idx3); else e.pos_hi |= (1ULL << (idx3 - 64));
+                        if (idx4 < 64) e.pos_lo |= (1ULL << idx4); else e.pos_hi |= (1ULL << (idx4 - 64));
+                        e.psum = lo64(weights[idx1]) + lo64(weights[idx2]) + lo64(weights[idx3]) + lo64(weights[idx4]);
+                        pool.push_back(e);
+                        if (pool.size() >= target_size * 2) break;
+                    }
+                    if (pool.size() >= target_size * 2) break;
+                }
+                if (pool.size() >= target_size * 2) break;
+            }
+            if (pool.size() >= target_size * 2) break;
+        }
+    }
+
+    // 3 ones, 1 minus-one
+    if (pool.size() < target_size) {
+        for (int i = 0; i < count; ++i) {
+            int p1 = start_idx + i;
+            for (int j = i + 1; j < count; ++j) {
+                int p2 = start_idx + j;
+                for (int k = j + 1; k < count; ++k) {
+                    int p3 = start_idx + k;
+                    for (int m = 0; m < count; ++m) {
+                        if (m == i || m == j || m == k) continue;
+                        int n1 = start_idx + m;
+                        TerEntry e{};
+                        if (p1 < 64) e.pos_lo |= (1ULL << p1); else e.pos_hi |= (1ULL << (p1 - 64));
+                        if (p2 < 64) e.pos_lo |= (1ULL << p2); else e.pos_hi |= (1ULL << (p2 - 64));
+                        if (p3 < 64) e.pos_lo |= (1ULL << p3); else e.pos_hi |= (1ULL << (p3 - 64));
+                        if (n1 < 64) e.neg_lo |= (1ULL << n1); else e.neg_hi |= (1ULL << (n1 - 64));
+                        e.psum = lo64(weights[p1]) + lo64(weights[p2]) + lo64(weights[p3]) - lo64(weights[n1]);
+                        pool.push_back(e);
+                        if (pool.size() >= target_size * 2) break;
+                    }
+                    if (pool.size() >= target_size * 2) break;
+                }
+                if (pool.size() >= target_size * 2) break;
+            }
+            if (pool.size() >= target_size * 2) break;
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────

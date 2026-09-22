@@ -1,8 +1,0 @@
-build/
-work/*.sol
-work/*.extsol
-work/*.out
-work/*.log
-work/*.core
-*.o
-__pycache__/
