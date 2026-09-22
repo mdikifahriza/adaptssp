@@ -131,6 +131,111 @@ TerParams ter_default_params(int n) {
 }
 
 // ─────────────────────────────────────────────────────────
+// Generator kombinasi generik: SEMUA entri dengan TEPAT `p` posisi +1 dan
+// `m` posisi -1 di antara `count` slot lokal (offset oleh start_idx).
+// Ditambahkan ke `pool`; berhenti lebih awal begitu pool.size() >= cap.
+// Menggantikan pendekatan lama (blok kode terpisah per kategori (p,m)
+// yang di-hardcode) dengan satu fungsi yang berlaku untuk (p,m) berapa pun.
+// ─────────────────────────────────────────────────────────
+static bool pick_negatives(
+    const std::vector<ter_u128>& weights, int start_idx,
+    const std::vector<int>& pos_sel, const std::vector<int>& remaining,
+    int m, int rstart, int depth, std::vector<int>& neg_sel,
+    size_t cap, std::vector<TerEntry>& pool
+) {
+    if (depth == m) {
+        TerEntry e{};
+        ter_u128 sum = 0;
+        for (int x : pos_sel) {
+            int gi = start_idx + x;
+            if (gi < 64) e.pos_lo |= (1ULL << gi); else e.pos_hi |= (1ULL << (gi - 64));
+            sum += weights[gi];
+        }
+        for (int x : neg_sel) {
+            int gi = start_idx + x;
+            if (gi < 64) e.neg_lo |= (1ULL << gi); else e.neg_hi |= (1ULL << (gi - 64));
+            sum -= weights[gi];
+        }
+        e.psum = lo64(sum);
+        pool.push_back(e);
+        return pool.size() >= cap;
+    }
+    for (int x = rstart; x < (int)remaining.size(); ++x) {
+        neg_sel[depth] = remaining[x];
+        if (pick_negatives(weights, start_idx, pos_sel, remaining, m, x + 1, depth + 1, neg_sel, cap, pool))
+            return true;
+    }
+    return false;
+}
+
+static bool pick_positives(
+    const std::vector<ter_u128>& weights, int start_idx, int count,
+    int p, int m, int start, int depth, std::vector<int>& pos_sel,
+    size_t cap, std::vector<TerEntry>& pool
+) {
+    if (depth == p) {
+        std::vector<char> used(count, 0);
+        for (int x : pos_sel) used[x] = 1;
+        std::vector<int> remaining;
+        remaining.reserve(count - p);
+        for (int x = 0; x < count; ++x) if (!used[x]) remaining.push_back(x);
+        std::vector<int> neg_sel(m);
+        return pick_negatives(weights, start_idx, pos_sel, remaining, m, 0, 0, neg_sel, cap, pool);
+    }
+    for (int x = start; x < count; ++x) {
+        pos_sel[depth] = x;
+        if (pick_positives(weights, start_idx, count, p, m, x + 1, depth + 1, pos_sel, cap, pool))
+            return true;
+    }
+    return false;
+}
+
+static bool generate_pm_category(
+    const std::vector<ter_u128>& weights, int start_idx, int count,
+    int p, int m, size_t cap, std::vector<TerEntry>& pool
+) {
+    if (p < 0 || m < 0 || p + m > count) return false;
+    if (p == 0 && m == 0) return false;  // kasus dasar ditangani terpisah
+    std::vector<int> pos_sel(p);
+    return pick_positives(weights, start_idx, count, p, m, 0, 0, pos_sel, cap, pool);
+}
+
+// ─────────────────────────────────────────────────────────
+// Melebarkan pencarian kategori (p,m) sebagai "cincin" (shell) berjarak
+// Manhattan meningkat dari (p_center, m_center) -- BUKAN dari (0,0) --
+// sampai pool cukup atau seluruh ruang komposisi habis.
+//
+// Ini yang membuat generator ADAPTIF terhadap n: titik pusat komposisi
+// "alami" vektor L3 (p_center, m_center) bergeser menjauh dari nol seiring
+// n membesar (lihat catatan di generate_half_base_pool), jadi menambah
+// lebih banyak kategori berbobot-rendah-dari-nol tidak akan pernah cukup
+// untuk n besar. Dengan memulai dari pusat yang benar dan melebar, jumlah
+// "cincin" yang dibutuhkan tetap kecil (empiris: 2-3 cincin) untuk n
+// berapa pun -- tidak perlu tahu n sebelumnya, tidak perlu edit kode.
+// ─────────────────────────────────────────────────────────
+static void generate_pm_shells(
+    const std::vector<ter_u128>& weights, int start_idx, int count,
+    int p_center, int m_center, size_t cap, size_t target_size,
+    std::vector<TerEntry>& pool
+) {
+    for (int radius = 0; pool.size() < target_size && radius <= 2 * count; ++radius) {
+        for (int dp = -radius; dp <= radius; ++dp) {
+            int dm_abs = radius - std::abs(dp);
+            for (int sign : {1, -1}) {
+                if (dm_abs == 0 && sign == -1) continue;  // hindari duplikat saat dm=0
+                int p = p_center + dp;
+                int m = m_center + sign * dm_abs;
+                if (p < 0 || m < 0 || p + m > count) continue;
+                if (p == 0 && m == 0) continue;  // sudah masuk sebagai kasus dasar
+                if (generate_pm_category(weights, start_idx, count, p, m, cap, pool))
+                    return;
+                if (pool.size() >= target_size) return;
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────
 // Level 3 Base Combinations Generation
 // Left half coordinates: [0, n/2 - 1]
 // Right half coordinates: [n/2, n - 1]
@@ -139,215 +244,29 @@ static void generate_half_base_pool(
     const std::vector<ter_u128>& weights,
     int start_idx, int end_idx,
     size_t target_size,
-    std::vector<TerEntry>& pool
+    std::vector<TerEntry>& pool,
+    double w2_center, double plus_center   // fraksi -1 dan +1 di L3, relatif thd `count` (lihat compute_derived)
 ) {
     int count = end_idx - start_idx;
     pool.clear();
     pool.reserve(target_size * 2);
+    const size_t cap = target_size * 2;
 
-    // 0 ones, 0 minus-ones
+    // ── Kategori dasar: (0,0) selalu disertakan (vektor nol). ──
     {
         TerEntry e0{};
         pool.push_back(e0);
     }
 
-    // 1 one, 0 minus-ones
-    for (int i = 0; i < count; ++i) {
-        int idx = start_idx + i;
-        TerEntry e{};
-        if (idx < 64) e.pos_lo = 1ULL << idx;
-        else e.pos_hi = 1ULL << (idx - 64);
-        e.psum = lo64(weights[idx]);
-        pool.push_back(e);
-    }
+    // ── Titik pusat komposisi "alami" untuk vektor L3, DIHITUNG dari rumus
+    //    paper (bukan angka hardcode) -> otomatis menyesuaikan berapa pun n.
+    //    p_center = jumlah entri +1 yang diharapkan, m_center = jumlah -1.
+    int p_center = (int)std::lround(plus_center * count);
+    int m_center = (int)std::lround(w2_center * count);
+    p_center = std::max(0, std::min(count, p_center));
+    m_center = std::max(0, std::min(count, m_center));
 
-    // 2 ones, 0 minus-ones
-    for (int i = 0; i < count; ++i) {
-        int idx1 = start_idx + i;
-        for (int j = i + 1; j < count; ++j) {
-            int idx2 = start_idx + j;
-            TerEntry e{};
-            if (idx1 < 64) e.pos_lo |= (1ULL << idx1);
-            else e.pos_hi |= (1ULL << (idx1 - 64));
-            if (idx2 < 64) e.pos_lo |= (1ULL << idx2);
-            else e.pos_hi |= (1ULL << (idx2 - 64));
-            e.psum = lo64(weights[idx1]) + lo64(weights[idx2]);
-            pool.push_back(e);
-        }
-    }
-
-    // 1 one, 1 minus-one (representation cancellation)
-    for (int i = 0; i < count; ++i) {
-        int idx_pos = start_idx + i;
-        for (int j = 0; j < count; ++j) {
-            if (i == j) continue;
-            int idx_neg = start_idx + j;
-            TerEntry e{};
-            if (idx_pos < 64) e.pos_lo = (1ULL << idx_pos);
-            else e.pos_hi = (1ULL << (idx_pos - 64));
-            if (idx_neg < 64) e.neg_lo = (1ULL << idx_neg);
-            else e.neg_hi = (1ULL << (idx_neg - 64));
-            e.psum = lo64(weights[idx_pos]) - lo64(weights[idx_neg]);
-            pool.push_back(e);
-        }
-    }
-
-    // 3 ones, 0 minus-ones
-    if (pool.size() < target_size) {
-        for (int i = 0; i < count; ++i) {
-            int idx1 = start_idx + i;
-            for (int j = i + 1; j < count; ++j) {
-                int idx2 = start_idx + j;
-                for (int k = j + 1; k < count; ++k) {
-                    int idx3 = start_idx + k;
-                    TerEntry e{};
-                    if (idx1 < 64) e.pos_lo |= (1ULL << idx1);
-                    else e.pos_hi |= (1ULL << (idx1 - 64));
-                    if (idx2 < 64) e.pos_lo |= (1ULL << idx2);
-                    else e.pos_hi |= (1ULL << (idx2 - 64));
-                    if (idx3 < 64) e.pos_lo |= (1ULL << idx3);
-                    else e.pos_hi |= (1ULL << (idx3 - 64));
-                    e.psum = lo64(weights[idx1]) + lo64(weights[idx2]) + lo64(weights[idx3]);
-                    pool.push_back(e);
-                    if (pool.size() >= target_size * 2) break;
-                }
-                if (pool.size() >= target_size * 2) break;
-            }
-            if (pool.size() >= target_size * 2) break;
-        }
-    }
-
-    // 2 ones, 1 minus-one
-    if (pool.size() < target_size) {
-        for (int i = 0; i < count; ++i) {
-            int p1 = start_idx + i;
-            for (int j = i + 1; j < count; ++j) {
-                int p2 = start_idx + j;
-                for (int k = 0; k < count; ++k) {
-                    if (k == i || k == j) continue;
-                    int n1 = start_idx + k;
-                    TerEntry e{};
-                    if (p1 < 64) e.pos_lo |= (1ULL << p1);
-                    else e.pos_hi |= (1ULL << (p1 - 64));
-                    if (p2 < 64) e.pos_lo |= (1ULL << p2);
-                    else e.pos_hi |= (1ULL << (p2 - 64));
-                    if (n1 < 64) e.neg_lo |= (1ULL << n1);
-                    else e.neg_hi |= (1ULL << (n1 - 64));
-                    e.psum = lo64(weights[p1]) + lo64(weights[p2]) - lo64(weights[n1]);
-                    pool.push_back(e);
-                    if (pool.size() >= target_size * 2) break;
-                }
-                if (pool.size() >= target_size * 2) break;
-            }
-            if (pool.size() >= target_size * 2) break;
-        }
-    }
-
-    // 0 ones, 1 minus-one
-    if (pool.size() < target_size) {
-        for (int i = 0; i < count; ++i) {
-            int idx_neg = start_idx + i;
-            TerEntry e{};
-            if (idx_neg < 64) e.neg_lo = (1ULL << idx_neg);
-            else e.neg_hi = (1ULL << (idx_neg - 64));
-            e.psum = 0ULL - lo64(weights[idx_neg]);
-            pool.push_back(e);
-        }
-    }
-
-    // 0 ones, 2 minus-ones
-    if (pool.size() < target_size) {
-        for (int i = 0; i < count; ++i) {
-            int n1 = start_idx + i;
-            for (int j = i + 1; j < count; ++j) {
-                int n2 = start_idx + j;
-                TerEntry e{};
-                if (n1 < 64) e.neg_lo |= (1ULL << n1);
-                else e.neg_hi |= (1ULL << (n1 - 64));
-                if (n2 < 64) e.neg_lo |= (1ULL << n2);
-                else e.neg_hi |= (1ULL << (n2 - 64));
-                e.psum = 0ULL - (lo64(weights[n1]) + lo64(weights[n2]));
-                pool.push_back(e);
-            }
-        }
-    }
-
-    // 0 ones, 3 minus-ones
-    if (pool.size() < target_size) {
-        for (int i = 0; i < count; ++i) {
-            int n1 = start_idx + i;
-            for (int j = i + 1; j < count; ++j) {
-                int n2 = start_idx + j;
-                for (int k = j + 1; k < count; ++k) {
-                    int n3 = start_idx + k;
-                    TerEntry e{};
-                    if (n1 < 64) e.neg_lo |= (1ULL << n1); else e.neg_hi |= (1ULL << (n1 - 64));
-                    if (n2 < 64) e.neg_lo |= (1ULL << n2); else e.neg_hi |= (1ULL << (n2 - 64));
-                    if (n3 < 64) e.neg_lo |= (1ULL << n3); else e.neg_hi |= (1ULL << (n3 - 64));
-                    e.psum = 0ULL - (lo64(weights[n1]) + lo64(weights[n2]) + lo64(weights[n3]));
-                    pool.push_back(e);
-                    if (pool.size() >= target_size * 2) break;
-                }
-                if (pool.size() >= target_size * 2) break;
-            }
-            if (pool.size() >= target_size * 2) break;
-        }
-    }
-
-    // 4 ones, 0 minus-ones
-    if (pool.size() < target_size) {
-        for (int i = 0; i < count; ++i) {
-            int idx1 = start_idx + i;
-            for (int j = i + 1; j < count; ++j) {
-                int idx2 = start_idx + j;
-                for (int k = j + 1; k < count; ++k) {
-                    int idx3 = start_idx + k;
-                    for (int l = k + 1; l < count; ++l) {
-                        int idx4 = start_idx + l;
-                        TerEntry e{};
-                        if (idx1 < 64) e.pos_lo |= (1ULL << idx1); else e.pos_hi |= (1ULL << (idx1 - 64));
-                        if (idx2 < 64) e.pos_lo |= (1ULL << idx2); else e.pos_hi |= (1ULL << (idx2 - 64));
-                        if (idx3 < 64) e.pos_lo |= (1ULL << idx3); else e.pos_hi |= (1ULL << (idx3 - 64));
-                        if (idx4 < 64) e.pos_lo |= (1ULL << idx4); else e.pos_hi |= (1ULL << (idx4 - 64));
-                        e.psum = lo64(weights[idx1]) + lo64(weights[idx2]) + lo64(weights[idx3]) + lo64(weights[idx4]);
-                        pool.push_back(e);
-                        if (pool.size() >= target_size * 2) break;
-                    }
-                    if (pool.size() >= target_size * 2) break;
-                }
-                if (pool.size() >= target_size * 2) break;
-            }
-            if (pool.size() >= target_size * 2) break;
-        }
-    }
-
-    // 3 ones, 1 minus-one
-    if (pool.size() < target_size) {
-        for (int i = 0; i < count; ++i) {
-            int p1 = start_idx + i;
-            for (int j = i + 1; j < count; ++j) {
-                int p2 = start_idx + j;
-                for (int k = j + 1; k < count; ++k) {
-                    int p3 = start_idx + k;
-                    for (int m = 0; m < count; ++m) {
-                        if (m == i || m == j || m == k) continue;
-                        int n1 = start_idx + m;
-                        TerEntry e{};
-                        if (p1 < 64) e.pos_lo |= (1ULL << p1); else e.pos_hi |= (1ULL << (p1 - 64));
-                        if (p2 < 64) e.pos_lo |= (1ULL << p2); else e.pos_hi |= (1ULL << (p2 - 64));
-                        if (p3 < 64) e.pos_lo |= (1ULL << p3); else e.pos_hi |= (1ULL << (p3 - 64));
-                        if (n1 < 64) e.neg_lo |= (1ULL << n1); else e.neg_hi |= (1ULL << (n1 - 64));
-                        e.psum = lo64(weights[p1]) + lo64(weights[p2]) + lo64(weights[p3]) - lo64(weights[n1]);
-                        pool.push_back(e);
-                        if (pool.size() >= target_size * 2) break;
-                    }
-                    if (pool.size() >= target_size * 2) break;
-                }
-                if (pool.size() >= target_size * 2) break;
-            }
-            if (pool.size() >= target_size * 2) break;
-        }
-    }
+    generate_pm_shells(weights, start_idx, count, p_center, m_center, cap, target_size, pool);
 }
 
 // ─────────────────────────────────────────────────────────
@@ -831,12 +750,16 @@ TerResult ter_solve(
     gpu_merge_stats_reset();
 #endif
 
-    // Generate base pools once for left and right halves
+    // Generate base pools once for left and right halves.
+    // params.w2 = fraksi -1 di level-2 (w^(2) dari paper); plus_center = fraksi
+    // +1 sesuai definisi D^n[w^(2), 1/18]. Titik pusat komposisi L3 diturunkan
+    // dari sini, bukan hardcode -- lihat generate_pm_shells di atas.
     std::vector<TerEntry> pool_left;
     std::vector<TerEntry> pool_right;
+    const double plus_center = params.w2 + 1.0 / 18.0;
     const auto tg0 = clk::now();
-    generate_half_base_pool(weights, 0, n_half, target_L3, pool_left);
-    generate_half_base_pool(weights, n_half, n, target_L3, pool_right);
+    generate_half_base_pool(weights, 0, n_half, target_L3, pool_left, params.w2, plus_center);
+    generate_half_base_pool(weights, n_half, n, target_L3, pool_right, params.w2, plus_center);
     const double t_gen_pool = secs(tg0, clk::now());
 
     // PERF: `pool_right` and `b2` are invariant across every restart run, so it is
