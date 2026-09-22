@@ -151,6 +151,10 @@ void TerParams::compute_derived() {
     int b2_raw = std::max(1, std::min(28, (int)std::lround(r2 * n + 2.0 * delta_L3 - delta_L2)));
     int b1_raw = std::max(b2_raw + 2, std::min(58, (int)std::lround(r1 * n + 3.0 * delta_L2 - delta_L1)));
 
+    // P2 (eksperimen): b2_delta menaikkan bit match level 2. Karena b2 di-clamp
+    // terhadap usable_bits dan b1 dipaksa >= b2+2, delta mengalir ke b1 juga.
+    b2_raw += b2_delta;
+
     // Adaptive clamp (Bug #3 fix): b1/b2 must never ask for more bits of
     // psum than this SPECIFIC instance's weights can actually produce.
     // psum values are sums of signed selections of the original weights,

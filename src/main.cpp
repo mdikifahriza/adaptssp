@@ -1040,6 +1040,7 @@ int main(int argc, char *argv[])
     std::string solver = "ter";
     double mem_budget_gb = 0.0;
     double ter_cpu_frac = -1.0;
+    int ter_b2_extra = 0;
     int extsol_swap_size = 4;
     size_t extsol_max_solutions = 1000;
 
@@ -1110,6 +1111,13 @@ int main(int argc, char *argv[])
         .help("TER: override jatah baris A yang diproses CPU di merge_level1 (fraksi 0.0..1.0). "
               "-1 (default) = mode adaptif EMA. Bermanfaat untuk kalibrasi manual di mesin 2 core.")
         .default_value(-1.0);
+
+    program.add_argument("--ter_b2_extra")
+        .store_into(ter_b2_extra)
+        .help("TER: tambahan bit pada b2 (level-2 merge). Tiap +1 menyusutkan probe L1 "
+              "~4x (kuadratik) tapi L1 makin jarang berisi solusi -> butuh lebih banyak run. "
+              "0 (default) = perilaku lama. Untuk eksperimen di Colab.")
+        .default_value(0);
 
     program.add_argument("--ss_gpu")
         .help("SS: radix-sort quarter2/quarter4 (>65536 elemen) di GPU via cub::DeviceRadixSort, "
@@ -1246,6 +1254,13 @@ int main(int argc, char *argv[])
         params.use_bucket_lookup = (program["--ter_bucket"] == true);
         if (ter_cpu_frac >= 0.0)
             ter_set_cpu_split_frac_override(ter_cpu_frac);
+        if (ter_b2_extra > 0)
+        {
+            params.b2_delta = ter_b2_extra;
+            params.compute_derived();
+            std::cout << "TER: b2_delta=" << ter_b2_extra << " (b1=" << params.b1
+                      << ", b2=" << params.b2 << ")\n";
+        }
         if (program["--ter_stats"] == true)
         {
             if (runs <= 0 || program["--autorestart"] == true)

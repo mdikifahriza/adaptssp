@@ -115,6 +115,13 @@ struct TerParams {
     size_t target_L3, target_L2, target_L1; // actual target list sizes per level
                                               // (floored versions of 2^(l*n); see compute_derived())
 
+    // P2 (eksperimen): tambahan bit yang dipaksa pada b2 (level-2 merge).
+    // Set > 0 untuk mengecilkan probe space L1 secara kuadratik: |L2| ~ 
+    // target_L3^2 / 2^b2, dan probe L1 = |A|*|B| ~ |L2|^2, jadi tiap +1 bit b2
+    // menyusutkan probe L1 ~4x. Risiko: L1 makin jarang memuat solusi -> butuh
+    // lebih banyak run. 0 (default) = perilaku lama/tanpa perubahan.
+    int    b2_delta = 0;
+
     // Solver behavior
     int    max_restarts;      // 0 = infinite until timeout
     double timeout_seconds;   // 0 = no timeout
