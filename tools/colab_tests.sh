@@ -41,20 +41,20 @@ hdr "1. Build GPU (CMake) dan CPU-only (g++)"
 [ -f external/argparse/include/argparse/argparse.hpp ] || \
   git clone --depth 1 https://github.com/p-ranav/argparse.git external/argparse
 SRC="$ROOT"; [ -f "$ROOT/src/main.cpp" ] && SRC="$ROOT/src"
-if cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/dev/null && cmake --build build -j2 2>&1 | tail -5 && [ -x build/markshare_main ]; then
-  ok "build GPU build/markshare_main"
+if cmake -S . -B build -DCMAKE_BUILD_TYPE=Release >/dev/null && cmake --build build -j2 2>&1 | tail -5 && [ -x build/adapt_ssp ]; then
+  ok "build GPU build/adapt_ssp"
 else
   bad "build GPU gagal -> tes GPU dilewati"; GPU_OK=0
 fi
 GPU_OK="${GPU_OK:-1}"
 mkdir -p build work
 if g++ -std=c++17 -O3 -march=broadwell -fopenmp -I"$SRC" -Iexternal/argparse/include/argparse \
-     "$SRC/main.cpp" "$SRC/ter_solver.cpp" -o build/markshare_cpu 2>&1 | tail -5 && [ -x build/markshare_cpu ]; then
-  ok "build CPU-only build/markshare_cpu"
+     "$SRC/main.cpp" "$SRC/ter_solver.cpp" -o build/adapt_ssp_cpu 2>&1 | tail -5 && [ -x build/adapt_ssp_cpu ]; then
+  ok "build CPU-only build/adapt_ssp_cpu"
 else
   bad "build CPU-only gagal"
 fi
-GPU=./build/markshare_main; CPU=./build/markshare_cpu
+GPU=./build/adapt_ssp; CPU=./build/adapt_ssp_cpu
 
 hdr "2. Tes unit explorer zero-sum swap (tools/test_swap.cpp, ASan+UBSan)"
 if g++ -std=c++17 -O2 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined \

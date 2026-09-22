@@ -3,7 +3,9 @@
 //           Quantum Algorithms via Ternary Representation Technique", Information 2025.
 
 #include "ter_solver.cuh"
+#ifdef WITH_GPU
 #include "ter_kernel.cuh"
+#endif
 #include <iostream>
 #include <vector>
 #include <algorithm>
@@ -252,9 +254,14 @@ static void generate_half_base_pool(
 // caller passes in a pre-sorted view built once, eliminating O(R
 // log R) work per call, per run.
 // ─────────────────────────────────────────────────────────
+// Langkah 7: binary search jalan di `right_keys` (uint64 rapat) bukan langsung di
+// TerEntry (40B, stride besar) -> lebih sedikit cache line disentuh per pencarian.
+// right_keys = sorted_right[i].psum & mask_m2, dihitung sekali oleh caller (b2 tetap
+// sepanjang run) dan dipakai ulang untuk 9 panggilan merge_level2.
 static void merge_level2(
     const std::vector<TerEntry>& L3_left,
     const std::vector<TerEntry>& sorted_right,
+    const std::vector<uint64_t>& right_keys,
     uint64_t s2,
     int b2,
     size_t max_cap,
@@ -264,28 +271,60 @@ static void merge_level2(
     uint64_t target_rem = s2 & mask_m2;
 
     L2_out.clear();
-    L2_out.reserve(std::min(max_cap, (size_t)8192));
+    const uint64_t* keys = right_keys.data();
+    const size_t nk = right_keys.size();
+    const size_t nl = L3_left.size();
 
+    // Langkah 7: paralel bila L3_left cukup besar (thread luar hanya 9-way di 9
+    // panggilan; ini menambah paralelisme dalam satu panggilan bila core > 9).
+    if (nl >= 2048 && omp_get_max_threads() > 1) {
+        int nthreads = omp_get_max_threads();
+        std::vector<std::vector<TerEntry>> local(nthreads);
+        size_t thread_cap = max_cap / (size_t)nthreads + 256;
+        for (auto& v : local) v.reserve(std::min(thread_cap, (size_t)4096));
+
+        #pragma omp parallel for schedule(dynamic, 256)
+        for (int ii = 0; ii < (int)nl; ++ii) {
+            int tid = omp_get_thread_num();
+            if (local[tid].size() >= thread_cap) continue;
+            const auto& u = L3_left[(size_t)ii];
+            uint64_t u_rem = u.psum & mask_m2;
+            uint64_t req_v = (target_rem >= u_rem) ? (target_rem - u_rem) : (mask_m2 + 1ULL + target_rem - u_rem);
+            const uint64_t* p = std::lower_bound(keys, keys + nk, req_v);
+            size_t k = (size_t)(p - keys);
+            for (; k < nk && keys[k] == req_v; ++k) {
+                const TerEntry& v = sorted_right[k];
+                TerEntry combined{};
+                combined.pos_lo = u.pos_lo | v.pos_lo;
+                combined.pos_hi = u.pos_hi | v.pos_hi;
+                combined.neg_lo = u.neg_lo | v.neg_lo;
+                combined.neg_hi = u.neg_hi | v.neg_hi;
+                combined.psum = u.psum + v.psum;
+                local[tid].push_back(combined);
+                if (local[tid].size() >= thread_cap) break;
+            }
+        }
+        L2_out.reserve(std::min(max_cap, (size_t)8192));
+        for (auto& v : local) for (auto& e : v) { L2_out.push_back(e); if (L2_out.size() >= max_cap) return; }
+        return;
+    }
+
+    L2_out.reserve(std::min(max_cap, (size_t)8192));
     for (const auto& u : L3_left) {
         uint64_t u_rem = u.psum & mask_m2;
         uint64_t req_v = (target_rem >= u_rem) ? (target_rem - u_rem) : (mask_m2 + 1ULL + target_rem - u_rem);
-
-        // Binary search in sorted_right
-        auto it = std::lower_bound(sorted_right.begin(), sorted_right.end(), req_v,
-            [mask_m2](const TerEntry& elem, uint64_t val) {
-                return (elem.psum & mask_m2) < val;
-            });
-
-        while (it != sorted_right.end() && ((it->psum & mask_m2) == req_v)) {
+        const uint64_t* p = std::lower_bound(keys, keys + nk, req_v);
+        size_t k = (size_t)(p - keys);
+        for (; k < nk && keys[k] == req_v; ++k) {
+            const TerEntry& v = sorted_right[k];
             TerEntry combined{};
-            combined.pos_lo = u.pos_lo | it->pos_lo;
-            combined.pos_hi = u.pos_hi | it->pos_hi;
-            combined.neg_lo = u.neg_lo | it->neg_lo;
-            combined.neg_hi = u.neg_hi | it->neg_hi;
-            combined.psum = u.psum + it->psum;
+            combined.pos_lo = u.pos_lo | v.pos_lo;
+            combined.pos_hi = u.pos_hi | v.pos_hi;
+            combined.neg_lo = u.neg_lo | v.neg_lo;
+            combined.neg_hi = u.neg_hi | v.neg_hi;
+            combined.psum = u.psum + v.psum;
             L2_out.push_back(combined);
             if (L2_out.size() >= max_cap) return;
-            ++it;
         }
     }
 }
@@ -309,34 +348,32 @@ static void merge_level2(
 // ─────────────────────────────────────────────────────────
 // Statistik merge_level1 per solve (langkah 4b).
 struct Level1Stats {
-    double sidecar_sec = 0.0;    // waktu membangun sidecar (hanya bila use_bucket)
-    size_t pairs = 0;            // total pasangan |A|*|B|
-    size_t gpu_calls = 0;
-    size_t gpu_fallbacks = 0;    // GPU gagal -> jatuh ke CPU
-    size_t cpu_calls = 0;
+    double sidecar_sec = 0.0;
+    size_t pairs = 0;
+    size_t gpu_calls = 0, gpu_fallbacks = 0, cpu_calls = 0;
+    double sum_cpu_frac = 0.0;
+    size_t split_calls = 0;
 };
 
-// Langkah 4c: bangun sidecar (kunci uint64 + bucket table) di atas sorted_C.
-// Mengembalikan false bila tidak aman dipakai; pemanggil lalu memakai binary search lama.
+static double g_cpu_split_frac = 0.05;
+static double g_cpu_split_frac_report() { return g_cpu_split_frac; }
+static constexpr size_t kGpuMinRows = 4096;
+static constexpr double kFracMin = 0.01, kFracMax = 0.50, kEmaAlpha = 0.5;
+
 static bool build_level1_sidecar(
-    const std::vector<TerEntry>& A,
-    const std::vector<TerEntry>& B,
-    const std::vector<TerEntry>& sorted_C,
-    uint64_t mask_m1,
-    int b1,
-    Level1Sidecar& sc
-) {
+    const std::vector<TerEntry>& A, const std::vector<TerEntry>& B,
+    const std::vector<TerEntry>& sorted_C, uint64_t mask_m1, int b1, Level1Sidecar& sc)
+{
     sc.valid = false;
     const size_t nc = sorted_C.size();
     if (nc == 0 || nc >= (size_t)UINT32_MAX) return false;
 
     sc.c_keys.resize(nc);
     for (size_t k = 0; k < nc; ++k) sc.c_keys[k] = sorted_C[k].psum & mask_m1;
-    // Bucket table mengandalkan urutan naik menurut kunci; kalau tidak terpenuhi, jangan dipakai.
     if (!std::is_sorted(sc.c_keys.begin(), sc.c_keys.end())) return false;
 
     int bits = 0;
-    while (((size_t)1 << (bits + 1)) <= nc) ++bits;   // floor(log2 nc)
+    while (((size_t)1 << (bits + 1)) <= nc) ++bits;
     if (bits < 1) bits = 1;
     if (bits > b1) bits = b1;
     sc.shift = b1 - bits;
@@ -355,145 +392,165 @@ static bool build_level1_sidecar(
     return true;
 }
 
-static void merge_level1(
-    const std::vector<TerEntry>& A,
-    const std::vector<TerEntry>& B,
-    const std::vector<TerEntry>& sorted_C,
-    uint64_t s1,
-    int b1,
-    size_t max_cap,
-    std::vector<TerEntry>& L1_out,
-    std::vector<std::vector<TerEntry>>& local_outs_scratch,
-    bool use_bucket,
-    Level1Sidecar& sc,
-    Level1Stats& stats
-) {
-    uint64_t mask_m1 = (1ULL << b1) - 1ULL;
-    uint64_t target_mod = s1 & mask_m1;
-    stats.pairs += A.size() * B.size();
-
-    // 4c: sidecar key + bucket lookup (opsional; hasil sama dengan binary search).
-    bool sc_ok = false;
-    if (use_bucket && !A.empty() && !B.empty() && !sorted_C.empty()) {
-        const auto t0 = std::chrono::high_resolution_clock::now();
-        sc_ok = build_level1_sidecar(A, B, sorted_C, mask_m1, b1, sc);
-        stats.sidecar_sec += std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count();
-        if (!sc_ok)
-            std::cerr << "[TER] PERINGATAN: sidecar tidak bisa dipakai (sorted_C tidak terurut menurut kunci "
-                         "atau terlalu besar); memakai binary search lama.\n";
-    }
-
-#ifdef WITH_GPU
-    // GPU is mandatory hardware (rencana.md §5.3): Level 1 merge always tries the GPU
-    // path first; the CPU path below is only a fallback when the GPU attempt itself
-    // fails (allocation/launch/sync error). Fallback is now reported, not silent.
-    if (!A.empty() && !B.empty() && !sorted_C.empty()) {
-        if (run_level1_merge_gpu(A, B, sorted_C, target_mod, mask_m1, max_cap, L1_out, sc_ok ? &sc : nullptr)) {
-            ++stats.gpu_calls;
-            return;
-        }
-        if (++stats.gpu_fallbacks == 1)
-            std::cerr << "[TER] PERINGATAN: run_level1_merge_gpu gagal; merge_level1 jatuh ke jalur CPU "
-                         "(penyebab ada di baris \"[GPU]\" di atasnya).\n";
-    }
-#endif
-    ++stats.cpu_calls;
-
-    // Fast CPU parallel merge with OpenMP
-    L1_out.clear();
+// CPU merge untuk baris A[a_off .. a_off+a_cnt). Pakai bucket bila sc_ok, else binary search.
+static void merge_level1_cpu_range(
+    const std::vector<TerEntry>& A, size_t a_off, size_t a_cnt,
+    const std::vector<TerEntry>& B, const std::vector<TerEntry>& sorted_C,
+    uint64_t target_mod, uint64_t mask_m1, bool sc_ok, const Level1Sidecar& sc,
+    size_t max_cap, std::vector<std::vector<TerEntry>>& local_outs)
+{
     int nthreads = omp_get_max_threads();
-    if ((int)local_outs_scratch.size() != nthreads) local_outs_scratch.resize(nthreads);
-    for (auto& v : local_outs_scratch) v.clear();  // keeps capacity, avoids realloc
-    size_t thread_cap = max_cap / nthreads + 256;
+    if ((int)local_outs.size() != nthreads) local_outs.resize(nthreads);
+    for (auto& v : local_outs) v.clear();
+    size_t thread_cap = max_cap / (size_t)nthreads + 256;
+    const size_t nB = B.size();
 
     if (sc_ok) {
-        // ── Jalur bucket: kunci uint64 sidecar; TerEntry disentuh hanya bila kunci cocok. ──
-        // Quick-reject lama ((u.pos & v.pos) & (u.neg | v.neg)) dibuang di jalur ini: bila
-        // pos/neg tiap entri tidak pernah tumpang tindih (invarian TerEntry), ekspresi itu
-        // selalu 0. check_and_add_ternary tetap memvalidasi penuh, jadi hasil tidak berubah.
         const uint64_t* keys = sc.c_keys.data();
         const uint32_t* start = sc.start.data();
         const uint64_t* a_ps = sc.a_ps.data();
         const uint64_t* b_ps = sc.b_ps.data();
         const int shift = sc.shift;
-        const size_t nB = B.size();
 
         #pragma omp parallel for schedule(dynamic, 16)
-        for (int i_a = 0; i_a < (int)A.size(); ++i_a) {
+        for (int ii = 0; ii < (int)a_cnt; ++ii) {
+            size_t i_a = a_off + (size_t)ii;
             int tid = omp_get_thread_num();
-            if (local_outs_scratch[tid].size() >= thread_cap) continue;
+            if (local_outs[tid].size() >= thread_cap) continue;
             const uint64_t a_base = target_mod - a_ps[i_a];
-
             for (size_t j = 0; j < nB; ++j) {
-                if (local_outs_scratch[tid].size() >= thread_cap) break;
-
+                if (local_outs[tid].size() >= thread_cap) break;
                 const uint64_t req_w = (a_base - b_ps[j]) & mask_m1;
                 const size_t bucket = (size_t)(req_w >> shift);
-                const uint32_t lo = start[bucket];
-                const uint32_t end = start[bucket + 1];
+                const uint32_t lo = start[bucket], end = start[bucket + 1];
                 if (lo == end) continue;
-
                 const uint64_t* p = std::lower_bound(keys + lo, keys + end, req_w);
                 size_t k = (size_t)(p - keys);
                 if (k >= end || keys[k] != req_w) continue;
-
                 const TerEntry& u = A[i_a];
                 const TerEntry& v = B[j];
                 for (; k < end && keys[k] == req_w; ++k) {
                     TerEntry comb;
                     if (check_and_add_ternary(u, v, sorted_C[k], comb)) {
-                        local_outs_scratch[tid].push_back(comb);
-                        if (local_outs_scratch[tid].size() >= thread_cap) break;
+                        local_outs[tid].push_back(comb);
+                        if (local_outs[tid].size() >= thread_cap) break;
                     }
                 }
             }
         }
     } else {
         #pragma omp parallel for schedule(dynamic, 16)
-        for (int i_a = 0; i_a < (int)A.size(); ++i_a) {
+        for (int ii = 0; ii < (int)a_cnt; ++ii) {
+            size_t i_a = a_off + (size_t)ii;
             int tid = omp_get_thread_num();
-            if (local_outs_scratch[tid].size() >= thread_cap) continue;
+            if (local_outs[tid].size() >= thread_cap) continue;
             const TerEntry& u = A[i_a];
-
             for (const auto& v : B) {
-                if (local_outs_scratch[tid].size() >= thread_cap) break;
-
-                // Quick check for incompatibility
+                if (local_outs[tid].size() >= thread_cap) break;
                 if (((u.pos_lo & v.pos_lo) & (u.neg_lo | v.neg_lo)) ||
                     ((u.pos_hi & v.pos_hi) & (u.neg_hi | v.neg_hi))) continue;
-
                 uint64_t uv_rem = (u.psum + v.psum) & mask_m1;
                 uint64_t req_w = (target_mod >= uv_rem) ? (target_mod - uv_rem) : (mask_m1 + 1ULL + target_mod - uv_rem);
-
-                // Binary search in sorted_C
                 auto it = std::lower_bound(sorted_C.begin(), sorted_C.end(), req_w,
-                    [mask_m1](const TerEntry& elem, uint64_t val) {
-                        return (elem.psum & mask_m1) < val;
-                    });
-
+                    [mask_m1](const TerEntry& e, uint64_t v2) { return (e.psum & mask_m1) < v2; });
                 while (it != sorted_C.end() && ((it->psum & mask_m1) == req_w)) {
                     TerEntry comb;
                     if (check_and_add_ternary(u, v, *it, comb)) {
-                        local_outs_scratch[tid].push_back(comb);
-                        if (local_outs_scratch[tid].size() >= thread_cap) break;
+                        local_outs[tid].push_back(comb);
+                        if (local_outs[tid].size() >= thread_cap) break;
                     }
                     ++it;
                 }
             }
         }
     }
+}
 
-    // Combine thread results
-    size_t total_found = 0;
-    for (const auto& vec : local_outs_scratch) total_found += vec.size();
-    L1_out.reserve(std::min(max_cap, total_found));
-
-    for (const auto& vec : local_outs_scratch) {
+static void append_capped(std::vector<TerEntry>& out, const std::vector<std::vector<TerEntry>>& local_outs, size_t max_cap) {
+    for (const auto& vec : local_outs) {
         for (const auto& item : vec) {
-            L1_out.push_back(item);
-            if (L1_out.size() >= max_cap) return;
+            out.push_back(item);
+            if (out.size() >= max_cap) return;
         }
     }
+}
+
+static void merge_level1(
+    const std::vector<TerEntry>& A, const std::vector<TerEntry>& B, const std::vector<TerEntry>& sorted_C,
+    uint64_t s1, int b1, size_t max_cap, std::vector<TerEntry>& L1_out,
+    std::vector<std::vector<TerEntry>>& local_outs_scratch, bool use_bucket, Level1Sidecar& sc, Level1Stats& stats)
+{
+    uint64_t mask_m1 = (1ULL << b1) - 1ULL;
+    uint64_t target_mod = s1 & mask_m1;
+    stats.pairs += A.size() * B.size();
+
+    bool sc_ok = false;
+    if (use_bucket && !A.empty() && !B.empty() && !sorted_C.empty()) {
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        sc_ok = build_level1_sidecar(A, B, sorted_C, mask_m1, b1, sc);
+        stats.sidecar_sec += std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count();
+    }
+
+    L1_out.clear();
+
+#ifdef WITH_GPU
+    if (!A.empty() && !B.empty() && !sorted_C.empty()) {
+        size_t total = A.size();
+        double frac = (total < kGpuMinRows) ? 0.0 : g_cpu_split_frac;
+        size_t cpu_rows = (size_t)(frac * (double)total);
+        size_t gpu_rows = total - cpu_rows;
+
+        bool launched = gpu_rows > 0 && gpu_l1_launch(A, B, sorted_C, target_mod, mask_m1, max_cap, sc_ok ? &sc : nullptr, 256);
+        if (gpu_rows > 0 && !launched) {
+            if (++stats.gpu_fallbacks == 1)
+                std::cerr << "[TER] PERINGATAN: gpu_l1_launch gagal, jalur CPU penuh dipakai.\n";
+            cpu_rows = total; gpu_rows = 0;
+        }
+
+        const auto t_cpu0 = std::chrono::high_resolution_clock::now();
+        std::vector<TerEntry> cpu_out;
+        if (cpu_rows > 0) {
+            merge_level1_cpu_range(A, gpu_rows, cpu_rows, B, sorted_C, target_mod, mask_m1, sc_ok, sc,
+                                   max_cap, local_outs_scratch);
+            append_capped(cpu_out, local_outs_scratch, max_cap);
+            ++stats.cpu_calls;
+        }
+        const double t_cpu = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t_cpu0).count();
+
+        if (launched) {
+            const auto t_gpu0 = std::chrono::high_resolution_clock::now();
+            std::vector<TerEntry> gpu_out;
+            if (gpu_l1_finish(gpu_out)) {
+                ++stats.gpu_calls;
+                const double t_gpu = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t_gpu0).count();
+                L1_out = std::move(gpu_out);
+                for (auto& e : cpu_out) { if (L1_out.size() >= max_cap) break; L1_out.push_back(e); }
+
+                if (cpu_rows > 0 && gpu_rows > 0 && t_cpu > 1e-6 && t_gpu > 1e-6) {
+                    double rate_cpu = (double)cpu_rows / t_cpu, rate_gpu = (double)gpu_rows / t_gpu;
+                    double target_frac = rate_cpu / (rate_cpu + rate_gpu);
+                    g_cpu_split_frac = kEmaAlpha * target_frac + (1.0 - kEmaAlpha) * g_cpu_split_frac;
+                } else if (cpu_rows == 0 && gpu_rows > 0) {
+                    g_cpu_split_frac = std::max(kFracMin, g_cpu_split_frac * 0.7);
+                }
+                g_cpu_split_frac = std::min(kFracMax, std::max(kFracMin, g_cpu_split_frac));
+                stats.sum_cpu_frac += (double)cpu_rows / (double)total;
+                ++stats.split_calls;
+                return;
+            }
+            gpu_l1_abort();
+            if (++stats.gpu_fallbacks == 1)
+                std::cerr << "[TER] PERINGATAN: gpu_l1_finish gagal; sisipan GPU dijatuhkan untuk run ini.\n";
+        }
+        L1_out = std::move(cpu_out);
+        stats.sum_cpu_frac += (cpu_rows > 0) ? (double)cpu_rows / (double)total : 1.0;
+        ++stats.split_calls;
+        return;
+    }
+#endif
+    ++stats.cpu_calls;
+    merge_level1_cpu_range(A, 0, A.size(), B, sorted_C, target_mod, mask_m1, sc_ok, sc, max_cap, local_outs_scratch);
+    append_capped(L1_out, local_outs_scratch, max_cap);
 }
 
 // ─────────────────────────────────────────────────────────
@@ -686,6 +743,8 @@ TerResult ter_solve(
             return ((uint64_t)a.psum & mask_m2_fixed) < ((uint64_t)b.psum & mask_m2_fixed);
         });
     const double t_sort_right = secs(ts0, clk::now());
+    std::vector<uint64_t> sorted_right_keys(sorted_pool_right.size());
+    for (size_t i = 0; i < sorted_pool_right.size(); ++i) sorted_right_keys[i] = sorted_pool_right[i].psum & mask_m2_fixed;
 
     if (params.verbose) {
         std::cout << "Generated Base Pool: Left=" << pool_left.size()
@@ -746,9 +805,8 @@ TerResult ter_solve(
 
         // 2. Build 9 Level 2 lists from base pool (pool_right pre-sorted once above)
         const auto p_l2_0 = clk::now();
-        #pragma omp parallel for schedule(dynamic)
         for (int m = 0; m < 9; ++m) {
-            merge_level2(pool_left, sorted_pool_right, s2[m], params.b2, l2_cap, L2[m]);
+            merge_level2(pool_left, sorted_pool_right, sorted_right_keys, s2[m], params.b2, l2_cap, L2[m]);
         }
         const double run_l2 = secs(p_l2_0, clk::now());
 
@@ -846,6 +904,10 @@ TerResult ter_solve(
                       << l1_stats.pairs << " pasangan); sidecar build=" << 1e3 * l1_stats.sidecar_sec << " ms"
                       << "; panggilan GPU=" << l1_stats.gpu_calls << " CPU=" << l1_stats.cpu_calls
                       << " fallback GPU->CPU=" << l1_stats.gpu_fallbacks << "\n";
+        if (l1_stats.split_calls > 0)
+            std::cout << "[TER-PROFIL] split GPU/CPU: rata-rata porsi baris A ke CPU=" << std::setprecision(3)
+                      << 100.0 * l1_stats.sum_cpu_frac / (double)l1_stats.split_calls
+                      << "% (adaptif EMA, sekarang=" << 100.0 * g_cpu_split_frac_report() << "%)\n";
 #ifdef WITH_GPU
         {
             const GpuMergeStats g = gpu_merge_stats_get();

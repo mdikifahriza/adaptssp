@@ -4,6 +4,9 @@
 #include "profiler.hpp"
 #include "ter_solver.cuh"
 #include "zero_sum_swap.h"
+#ifdef WITH_GPU
+#include "ss_kernel.cuh"
+#endif
 
 #include <algorithm>
 #include <bitset>
@@ -702,7 +705,7 @@ bool print_and_write_1d_ss_solution(size_t index_list1, size_t index_list2, size
 
 template <typename T>
 bool shroeppel_shamir_1d(const std::vector<T> &values, T target, const std::string &instance_name,
-                         int k_radius = -1, std::vector<size_t> *solution_out = nullptr)
+                         int k_radius = -1, std::vector<size_t> *solution_out = nullptr, bool ss_gpu_sort = false)
 {
     std::cout << "Running 1D Schroeppel-Shamir" << std::endl;
     std::cout << "Running with " << omp_get_max_threads() << " threads" << std::endl;
@@ -785,12 +788,36 @@ bool shroeppel_shamir_1d(const std::vector<T> &values, T target, const std::stri
     auto &set4_weights = filtered4.first;
     auto &set4_subsets = filtered4.second;
 
-    auto asc_indices_set2_weights = sort_indices(set2_weights, true);
-    auto desc_indices_set4_weights = sort_indices(set4_weights, false);
-    const auto set2_weights_sorted_asc = apply_permutation(set2_weights, asc_indices_set2_weights);
-    const auto set2_subsets_sorted_asc = apply_permutation(set2_subsets, asc_indices_set2_weights);
-    const auto set4_weights_sorted_desc = apply_permutation(set4_weights, desc_indices_set4_weights);
-    const auto set4_subsets_sorted_desc = apply_permutation(set4_subsets, desc_indices_set4_weights);
+    std::vector<T> set2_weights_sorted_asc, set4_weights_sorted_desc;
+    std::vector<size_t> set2_subsets_sorted_asc, set4_subsets_sorted_desc;
+    bool gpu_sorted2 = false, gpu_sorted4 = false;
+#ifdef WITH_GPU
+    if constexpr (std::is_same_v<T, uint64_t>) {
+        if (ss_gpu_sort && set2_weights.size() > (1u << 16)) {
+            set2_weights_sorted_asc = set2_weights;
+            set2_subsets_sorted_asc = set2_subsets;
+            gpu_sorted2 = gpu_sort_weights_with_payload(set2_weights_sorted_asc, set2_subsets_sorted_asc, true);
+        }
+        if (ss_gpu_sort && set4_weights.size() > (1u << 16)) {
+            set4_weights_sorted_desc = set4_weights;
+            set4_subsets_sorted_desc = set4_subsets;
+            gpu_sorted4 = gpu_sort_weights_with_payload(set4_weights_sorted_desc, set4_subsets_sorted_desc, false);
+        }
+    }
+#endif
+    if (!gpu_sorted2) {
+        auto asc_indices_set2_weights = sort_indices(set2_weights, true);
+        set2_weights_sorted_asc = apply_permutation(set2_weights, asc_indices_set2_weights);
+        set2_subsets_sorted_asc = apply_permutation(set2_subsets, asc_indices_set2_weights);
+    }
+    if (!gpu_sorted4) {
+        auto desc_indices_set4_weights = sort_indices(set4_weights, false);
+        set4_weights_sorted_desc = apply_permutation(set4_weights, desc_indices_set4_weights);
+        set4_subsets_sorted_desc = apply_permutation(set4_subsets, desc_indices_set4_weights);
+    }
+    if (ss_gpu_sort && (set2_weights.size() > (1u << 16) || set4_weights.size() > (1u << 16)))
+        std::cout << "[SS-GPU] sort quarter2=" << (gpu_sorted2 ? "GPU" : "CPU(fallback)")
+                  << " quarter4=" << (gpu_sorted4 ? "GPU" : "CPU(fallback)") << "\n";
 
     if (set2_weights_sorted_asc.empty() || set4_weights_sorted_desc.empty())
         continue;
@@ -1077,6 +1104,11 @@ int main(int argc, char *argv[])
               "success rate per run + profil per fase. Wajib dengan --runs N (N > 0), tidak bisa dengan --autorestart.")
         .flag();
 
+    program.add_argument("--ss_gpu")
+        .help("SS: radix-sort quarter2/quarter4 (>65536 elemen) di GPU via cub::DeviceRadixSort, "
+              "bukan std::sort CPU. Logika heap k-way merge tetap di CPU. Jalur uint64_t saja.")
+        .flag();
+
     program.add_argument("--extsol")
         .help("Setelah solusi ditemukan, jelajahi solusi lain yang terhubung lewat swap nol-jumlah "
               "(BFS bertingkat); hasil ditulis ke <instance>.extsol. Hanya menjelajahi komponen "
@@ -1248,7 +1280,7 @@ int main(int argc, char *argv[])
     else if (can_fit_size_t(instance_1d))
     {
         std::cout << "[SS] Menggunakan Schroeppel-Shamir Solver (64-bit)\n";
-        found = shroeppel_shamir_1d<uint64_t>(vals64, target64, instance_name, k_radius, &solution_indices);
+        found = shroeppel_shamir_1d<uint64_t>(vals64, target64, instance_name, k_radius, &solution_indices, program["--ss_gpu"] == true);
     }
     else
     {

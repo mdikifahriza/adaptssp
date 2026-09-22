@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.18)
 
 set(CMAKE_CUDA_ARCHITECTURES 75)
 
-project(adaptssp LANGUAGES CXX CUDA)
+project(adapt_ssp LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -31,22 +31,23 @@ if(NOT EXISTS "${ARGPARSE_INCLUDE_DIR}/argparse.hpp")
         "Jalankan: git clone --depth 1 https://github.com/p-ranav/argparse.git external/argparse")
 endif()
 
-add_executable(adaptssp
+add_executable(adapt_ssp
     ${SRC_DIR}/main.cpp
     ${SRC_DIR}/ter_solver.cpp
     ${SRC_DIR}/ter_kernel.cu
+    ${SRC_DIR}/ss_kernel.cu
 )
 
-target_include_directories(adaptssp PRIVATE
+target_include_directories(adapt_ssp PRIVATE
     ${SRC_DIR}
     ${ARGPARSE_INCLUDE_DIR}
 )
 
 # GPU wajib: makro ini dipakai guard #ifdef di ter_solver.cpp / ter_kernel.*
-target_compile_definitions(adaptssp PRIVATE WITH_GPU)
+target_compile_definitions(adapt_ssp PRIVATE WITH_GPU)
 
 # Xeon Broadwell (AVX2/BMI2/FMA, tanpa AVX-512) dan Tesla T4 (sm_75)
-target_compile_options(adaptssp PRIVATE
+target_compile_options(adapt_ssp PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-march=broadwell>
     $<$<COMPILE_LANGUAGE:CXX>:-mtune=broadwell>
     $<$<COMPILE_LANGUAGE:CXX>:-funroll-loops>
@@ -54,9 +55,9 @@ target_compile_options(adaptssp PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
 )
 
-# Hanya satu file .cu dan tidak ada simbol __device__/__constant__ lintas-file,
-# jadi separable compilation tidak diperlukan.
-set_target_properties(adaptssp PROPERTIES
+# Dua file .cu (ter_kernel.cu, ss_kernel.cu), tidak ada simbol __device__/__constant__
+# yang dibagi lintas file, jadi separable compilation tidak diperlukan.
+set_target_properties(adapt_ssp PROPERTIES
     CUDA_ARCHITECTURES 75
     CUDA_SEPARABLE_COMPILATION OFF
 )
@@ -70,14 +71,14 @@ if(ENABLE_LTO)
     include(CheckIPOSupported)
     check_ipo_supported(RESULT ipo_ok OUTPUT ipo_msg LANGUAGES CXX)
     if(ipo_ok)
-        set_property(TARGET adaptssp PROPERTY INTERPROCEDURAL_OPTIMIZATION ON)
+        set_property(TARGET adapt_ssp PROPERTY INTERPROCEDURAL_OPTIMIZATION ON)
         message(STATUS "LTO aktif")
     else()
         message(WARNING "LTO tidak didukung: ${ipo_msg}")
     endif()
 endif()
 
-target_link_libraries(adaptssp PRIVATE
+target_link_libraries(adapt_ssp PRIVATE
     CUDA::cudart
     OpenMP::OpenMP_CXX
     Threads::Threads

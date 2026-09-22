@@ -1,11 +1,11 @@
 # PROGRESS — markshare_main (hybrid CPU/GPU)
 
 Rencana induk: `rencana.md` (Revisi 3). Nomor langkah di bawah mengacu ke §11 rencana.
-Terakhir diperbarui: 19 Sep 2026 (sesi 4: Langkah 4, alat tes, 4b, 4c, housekeeping — SEMUA DITULIS, BELUM ADA YANG DIKOMPILASI/DIJALANKAN) — **Langkah 1 + 2 selesai dan TERVERIFIKASI di sandbox CPU (diferensial SS vs brute force, sanitizer). Bug ke-3 (`filter_by_cardinality`) diperbaiki. Langkah 3 (CMake) LULUS di Colab T4: build nvcc sm_75 sukses, TER jalur GPU menemukan solusi valid, compute-sanitizer 0 error, diferensial SS 0 mismatch. Berikutnya: Langkah 4.**
+Terakhir diperbarui: 19 Sep 2026 (sesi 5: Langkah 4-7 SEMUA DITULIS sampai tuntas — user punya repo git lokal sebagai safe point, TIDAK ADA yang dikompilasi/dijalankan di sesi ini atas permintaan eksplisit) — **Langkah 1 + 2 selesai dan TERVERIFIKASI di sandbox CPU (diferensial SS vs brute force, sanitizer). Bug ke-3 (`filter_by_cardinality`) diperbaiki. Langkah 3 (CMake) LULUS di Colab T4: build nvcc sm_75 sukses, TER jalur GPU menemukan solusi valid, compute-sanitizer 0 error, diferensial SS 0 mismatch. Berikutnya: Langkah 4.**
 
 ## Status
 
-- Langkah aktif: **verifikasi di Colab** untuk semua yang ditulis di sesi 4 (Langkah 4, 4b, 4c, alat tes). Cukup satu perintah: `bash tools/colab_tests.sh` (lihat "Cara verifikasi sesi 4"). Setelah itu: baca `work/profil_*.txt` -> putuskan K6 dan apakah Langkah 5/6 layak.
+- Langkah aktif: **verifikasi di Colab** untuk sesi 4 dan 5 sekaligus (Langkah 4, 4b, 4c, 5, 6, 7). `bash tools/colab_tests.sh`. User sudah commit versi sebelum sesi 5 sebagai safe point; kalau Langkah 5/6/7 error, revert ke commit itu lalu laporkan pesan errornya di sini.
 - Terakhir selesai: Langkah 3 (CMake baru, diuji di Colab T4). Langkah 1 + 2 sekarang juga terverifikasi pada build GPU di Colab (diferensial SS 0 mismatch).
 - Sedang dikerjakan: —
 - Terputus di tengah? Tidak.
@@ -129,21 +129,64 @@ bash tools/colab_tests.sh            # atau QUICK=1 / FULL=1
 ```
 Setelah lulus: `bash tools/setup_git.sh` (dan `REMOVE_OLD=1` bila sudah yakin menghapus `cuda_kernels.*`/`markshare.hpp`).
 
-*(Langkah 5 dst. tidak berubah dari draft sebelumnya — lihat rencana.md §11 untuk isi lengkap.)*
+### Sesi 5 — Langkah 5, 6, 7 **[ditulis tuntas, BELUM dikompilasi — permintaan eksplisit user]**
+Tidak ada kompilasi/run sama sekali di sesi ini (bukan hanya "belum sempat" — user secara eksplisit minta tidak usah tes). Anggap `ter_kernel.cu`, `ss_kernel.cu`, dan perubahan `ter_solver.cpp` butuh beberapa putaran perbaikan kompilasi.
+
+**Langkah 5a — sesi GPU persisten**
+- [x] `ter_kernel.cu` ditulis ulang total: `Session` global menampung stream non-blocking, 4 `cudaEvent`, buffer device (`DevBuf::ensure`, tumbuh geometris, tidak realloc tiap panggilan) dan buffer **pinned** (`PinBuf`) untuk A/B/C/sidecar/count — mengganti `cudaMallocHost`->`memcpy`->`cudaMemcpy` sync lama.
+- [x] API baru: `gpu_l1_launch(...)` (non-blocking, kembali segera setelah submit ke stream) + `gpu_l1_finish(L1_out)` (sync + salin hasil) + `gpu_l1_abort()` + `gpu_l1_release()`. `run_level1_merge_gpu` lama dipertahankan sebagai `launch`+`finish` sinkron untuk kompatibilitas.
+- [ ] Belum ada pemanggilan `gpu_l1_release()` di jalur keluar `main` — buffer/stream/event dibiarkan sampai proses exit (OS membersihkan; untuk CLI sekali-jalan ini tidak masalah, tapi kalau dipakai sebagai library harus dipanggil manual).
+
+**Langkah 5b — split baris A adaptif (CPU/GPU)**
+- [x] `merge_level1` di `ter_solver.cpp` ditulis ulang: bila `WITH_GPU`, baris A dibelah — prefix `[0, gpu_rows)` dikirim ke GPU lewat `gpu_l1_launch` (async), sisanya `[gpu_rows, A.size())` dikerjakan CPU (`merge_level1_cpu_range`, OpenMP, mendukung sidecar/bucket 4c) **secara bersamaan** (launch dulu baru CPU jalan, baru `gpu_l1_finish`) — bukan sekuensial.
+- [x] `g_cpu_split_frac` dimulai 0.05, GPU-saja bila `|A| < kGpuMinRows=4096`, EMA α=0.5 menyeimbangkan `rate_cpu = cpu_rows/t_cpu` vs `rate_gpu = gpu_rows/t_gpu`, clamp `[0.01, 0.50]`. Satu thread (thread utama, bukan thread OpenMP terpisah) berperan sebagai orkestrator: launch -> CPU -> finish -> gabung -> update EMA.
+- [x] Fallback: `gpu_l1_launch` gagal -> semua baris ke CPU (`cpu_rows=total`); `gpu_l1_finish` gagal -> `gpu_l1_abort()` lalu pakai hasil CPU saja untuk run itu (bukan gagal total). Kedua kasus mencetak peringatan sekali (baris pertama saja, lewat `++stats.gpu_fallbacks == 1`).
+
+**Langkah 5c — log rasio**
+- [x] `[TER-PROFIL] split GPU/CPU: rata-rata porsi baris A ke CPU=...% (adaptif EMA, sekarang=...%)` di ringkasan `ter_solve`.
+
+**Langkah 5d — TIDAK dikerjakan (sesuai rencana: opsional)**
+- [ ] Pipelining lintas level (launch L1 slot j+1 sambil slot j masih di GPU), root di GPU, `merge_level2` full di GPU: tidak ditulis. Alasan pemilihan (bukan "belum sempat"): 5a+5b sendiri sudah memberi overlap CPU/GPU dalam satu panggilan `merge_level1` (launch async lalu CPU jalan sebelum `finish`); manfaat tambahan dari pipelining lintas-level lebih kecil dan jauh lebih rawan bug tanpa bisa diuji. Root tetap di CPU: pencarian akhirnya kecil (3 list L1) dan branchy (pencocokan pasangan lalu verifikasi u128 exact) — bukan kandidat GPU yang baik.
+
+**Langkah 6 — GPU SS, DIRANCANG ULANG (bukan count/scan/expand/match/verify literal per §6a-6f)**
+- Setelah membaca ulang `shroeppel_shamir_1d`: algoritmanya adalah **k-way merge pakai heap** antar 4 quarter (`extract_pairs_from_heap`), bukan cross-product padat. Itu branchy dan sekuensial (pointer heap saling bergantung) — **bukan** kandidat GPU yang cocok, dan instruksi terbaru eksplisit: jangan lempar kerjaan yang GPU tidak sanggup lakukan dengan baik.
+- Bagian yang murni data-paralel dan memang berat: `sort_indices` + `apply_permutation` men-sort **penuh** `set2_weights`/`set4_weights` (bisa 2^24+ elemen) di CPU dengan `std::sort` berbasis indeks (comparison sort, cache-tidak-ramah) — **diulang setiap iterasi k**. Ini yang dipindah ke GPU.
+- [x] `ss_kernel.cu`/`ss_kernel.cuh` baru: `gpu_sort_weights_with_payload(weights, subsets, ascending)` — `cub::DeviceRadixSort::SortPairs`/`SortPairsDescending` (key=uint64 weight, payload=uint64 indeks subset). Radix sort, bukan comparison sort; murni GPU-friendly.
+- [x] Flag `--ss_gpu`: dipakai hanya untuk jalur `uint64_t` (`if constexpr`), hanya bila quarter > 65536 elemen (di bawah itu overhead PCIe/alokasi kemungkinan lebih mahal dari `std::sort` CPU — **asumsi, belum diukur**). Gagal -> fallback ke `sort_indices`/`apply_permutation` CPU lama, dicetak `[SS-GPU] sort quarter2=... quarter4=...`.
+- [ ] Tidak diintegrasikan: kernel `count`/`scan`/`expand`/`match`/`verify` generik dari draf rencana lama — sudah tidak relevan untuk algoritma heap yang sebenarnya dipakai. **Rencana §6a-§6f di bawah ini sebaiknya dianggap usang**, diganti catatan di atas.
+- [ ] Belum diukur: threshold `1<<16`, dan apakah radix sort GPU + transfer PCIe benar-benar lebih cepat dari `std::sort` CPU untuk quarter berukuran khas instance ini.
+
+**Langkah 7 — cache blocking & tuning**
+- [x] `merge_level2`: pencarian biner sekarang jalan di `right_keys` (array `uint64_t` rapat = `psum & mask_m2`), bukan langsung ke `TerEntry` (40 B/elemen) — mengurangi cache line yang disentuh selama descent binary search. `right_keys` dihitung **sekali** di `ter_solve` (bukan 9x, karena `mask_m2` tetap sepanjang run) dan dipakai ulang oleh 9 pemanggilan `merge_level2`.
+- [x] `merge_level2` sekarang **paralel di dalam** (OpenMP, threshold `nl >= 2048`) memakai pola thread-local + gabung yang sama dengan `merge_level1`; loop luar 9-way di `ter_solve` **dijadikan serial** (paralelisme dipindah ke dalam) supaya tidak ada nested-OpenMP (yang butuh `OMP_NESTED`/`omp_set_max_active_levels` dan rawan salah kalau tidak diuji). Ini net-positif hanya bila core tersedia > 9 — kalau tidak, sebelumnya (9-way luar) mungkin lebih baik; **belum dibandingkan**.
+- [ ] LTO (`ENABLE_LTO`, ditulis sesi 4) belum diuji dengan target campuran CXX+CUDA ini.
+- [ ] Tuning `l1..r2`/`eps*` (K6) tetap menunggu data `[TER-PROFIL]` — tidak berubah dari sesi 4.
+
+**Cara verifikasi (sama seperti sebelumnya, `tools/colab_tests.sh` BELUM diperbarui untuk `--ss_gpu`/5b/5c secara eksplisit di sesi ini):**
+```bash
+bash tools/colab_tests.sh            # cakupan lama (4, 4b, 4c) masih relevan dan akan memakai jalur 5a/5b otomatis (default--nyala)
+# manual untuk yang baru di sesi 5:
+./build/markshare_main -f work/big32.prb --solver ter --ter_stats --runs 10          # cek baris "split GPU/CPU" di profil
+./build/markshare_main -f work/p28.prb   --solver ss  --k_radius -1 --ss_gpu          # cek baris "[SS-GPU] sort quarter2=..."
+```
+Kalau `merge_level2` paralel-dalam (Langkah 7) mengubah `L2 avg=...` dibanding sebelumnya untuk instance sama+seed sama, itu BUG (urutan penggabungan thread-local semestinya tidak boleh mengubah *isi* himpunan, hanya urutannya di dalam list — kalau berikutnya dipakai untuk sort ulang seperti L2->C, urutan tidak relevan; tapi kalau ada kode lain yang mengandalkan urutan L2, periksa manual).
+
+*(Langkah 8 dst. tidak berubah dari draft sebelumnya — lihat rencana.md §11 untuk isi lengkap.)*
 
 ## Daftar file (versi)
 
 | File | Versi | Catatan |
 |---|---|---|
-| `main.cpp` | **v4 (sesi 4)** | v2 + `--extsol*` (v3) + `--ter_bucket`, `--ter_stats`. **Belum dikompilasi/diuji.** |
-| `ter_solver.cpp` | **v2 (sesi 4)** — `merge_level1` + `ter_solve` ditulis ulang (profil, sidecar/bucket, mode statistik); belum dikompilasi. v1: | Langkah 1 (Bug 1) + Langkah 2 (`use_gpu` dibuang dari `merge_level1`) diterapkan. Dikirim di sesi ini. |
+| `main.cpp` | **v5 (sesi 5)** | v4 + `--ss_gpu`, integrasi `gpu_sort_weights_with_payload` di `shroeppel_shamir_1d`. **Belum dikompilasi/diuji.** |
+| `ter_solver.cpp` | **v3 (sesi 5)** — `merge_level1` ditulis ulang lagi (split adaptif 5b/5c via API async), `merge_level2` ditulis ulang (cache-blocked + paralel-dalam, Langkah 7); belum dikompilasi. v2 (sesi 4): profil, sidecar/bucket, mode statistik. v1: | Langkah 1 (Bug 1) + Langkah 2 (`use_gpu` dibuang dari `merge_level1`) diterapkan. Dikirim di sesi ini. |
 | `ter_solver.cuh` | **v2 (sesi 4)** — `Level1Sidecar`, `TerParams::{use_bucket_lookup,continue_after_found}`, `TerResult::successful_runs`. v1: | `TerEntry::psum` → `uint64_t`; `TerParams::use_gpu` dibuang. Dikirim di sesi ini. |
-| `ter_kernel.cu`, `ter_kernel.cuh` | **v1 (sesi 4)** — ditulis ulang: kernel bucket, `GpuMergeStats`, cek error, RAII, guard grid; kernel lama tidak diubah. **Belum pernah dikompilasi dengan nvcc.** v0 (asli): | Tidak disentuh sesi ini — `psum` ikut jadi `uint64_t` otomatis lewat `TerEntry`, perilaku tidak berubah. Belum diverifikasi compile (butuh nvcc, tidak ada di sandbox). |
+| `ter_kernel.cu`, `ter_kernel.cuh` | **v2 (sesi 5)** — sesi GPU persisten (stream+pinned+event), API async `gpu_l1_launch/finish/abort/release`. **Belum pernah dikompilasi dengan nvcc.** v1 (sesi 4): kernel bucket, `GpuMergeStats`, cek error, RAII, guard grid; v0 (asli): | Tidak disentuh sesi ini — `psum` ikut jadi `uint64_t` otomatis lewat `TerEntry`, perilaku tidak berubah. Belum diverifikasi compile (butuh nvcc, tidak ada di sandbox). |
 | `cuda_kernels.cu`, `cuda_kernels.cuh` | — | **DIHAPUS** (Langkah 2). User perlu hapus file fisiknya dari repo sendiri. |
 | `markshare.hpp` | — | **DIHAPUS** (Langkah 2, K1). User perlu hapus file fisiknya dari repo sendiri. |
 | `pairs_tuple.hpp`, `profiler.hpp` | v0 (asli) | tetap, tidak diubah |
-| `CMakeLists.txt` | **v2 (sesi 4)** — + opsi `ENABLE_LTO` (OFF). v1 (sesi 3): | Ditulis ulang dari nol (v0 asli tidak ada di upload): CUDA wajib, sm_75, `WITH_GPU` selalu aktif. Belum di-build dengan nvcc. |
-| `tools/difftest.py`, `tools/genplant.py`, `tools/verify_sol.py`, `tools/bruteforce.py`, `tools/colab_tests.sh`, `tools/setup_git.sh`, `.gitignore` | **ditulis ulang (sesi 4)** | versi sesi 3 tidak ada di upload; ini rekonstruksi, belum dijalankan. Argumen `genplant.py` sama (`OUT N BITS SEED`). |
+| `CMakeLists.txt` | **v3 (sesi 5)** — + `ss_kernel.cu` ke `add_executable`. v2 (sesi 4): opsi `ENABLE_LTO` (OFF). v1 (sesi 3): | Ditulis ulang dari nol (v0 asli tidak ada di upload): CUDA wajib, sm_75, `WITH_GPU` selalu aktif. Belum di-build dengan nvcc. |
+| `tools/difftest.py`, `tools/genplant.py`, `tools/verify_sol.py`, `tools/bruteforce.py`, `tools/colab_tests.sh`, `tools/setup_git.sh`, `.gitignore` | **ditulis ulang (sesi 4), TIDAK diperbarui sesi 5** | belum mencakup `--ss_gpu` / verifikasi 5b/5c secara otomatis; lihat "Cara verifikasi" di atas untuk perintah manual sesi 5. |
+| `ss_kernel.cu`, `ss_kernel.cuh` | **baru (sesi 5)** | radix sort GPU (cub) untuk `set2_weights`/`set4_weights` di SS |
 | `zero_sum_swap.h` | v1 (native, tidak diubah sesi 4) | Langkah 4; header compile bersih, belum ada tes diferensial yang dijalankan |
 | `tools/test_swap.cpp` | baru (sesi 4), belum dijalankan | tes diferensial explorer vs oracle BFS |
 | `external/argparse/` | — | di-clone di sandbox untuk compile-test sesi ini (tidak persisten); clone ulang di Colab |
@@ -210,6 +253,7 @@ nsys profile -t cuda --stats=true ./build/markshare_main -f p28.prb --solver ter
 | 19 Sep 2026 | 1 (Bug 1 + Bug 2) | Kode selesai; compile OK; **run/diff regresi belum dilakukan** (dihentikan oleh user) | `ter_solver.cuh`, `ter_solver.cpp`, `main.cpp` |
 | 19 Sep 2026 | 2 (dead code, CLI, AVX2) | Kode selesai; compile+link OK; jalur error CLI dites manual; **diff output vs baseline belum dilakukan** | `main.cpp`, `ter_solver.cpp`, `ter_solver.cuh` |
 | 19 Sep 2026 (sesi 3) | Fix Bug 3 + verifikasi Langkah 1/2 | `filter_by_cardinality` diperbaiki; kontrol tanpa fix 19/300 crash, dengan fix 0; diferensial SS 0 mismatch (~1700 + 80 `--big`), ASan/UBSan bersih | `main.cpp` |
+| 19 Sep 2026 (sesi 5) | 5, 6 (dirancang ulang), 7 | Ditulis tuntas atas permintaan eksplisit user (tanpa kompilasi/tes); user sudah commit versi sesi 4 sebagai safe point | `ter_kernel.cu/.cuh`, `ter_solver.cpp`, `ss_kernel.cu/.cuh` (baru), `main.cpp`, `CMakeLists.txt`, `PROGRESS.md` |
 | 19 Sep 2026 (sesi 4, lanjutan) | alat tes + 4b + 4c + housekeeping | Semua ditulis; hanya cek sintaks skrip; **C++/CUDA belum dikompilasi**; verifikasi lewat `tools/colab_tests.sh` | `main.cpp`, `ter_solver.cpp/.cuh`, `ter_kernel.cu/.cuh`, `CMakeLists.txt`, `tools/*`, `.gitignore`, `PROGRESS.md` |
 | 19 Sep 2026 (sesi 4) | 4 (`--extsol`) | Kode `main.cpp` v3 ditulis; header dicek compile; **tidak ada tes yang dijalankan** (atas permintaan user) | `main.cpp`, `PROGRESS.md`, `tools/test_swap.cpp` |
 | 19 Sep 2026 (sesi 3) | 3 (CMake) | `CMakeLists.txt` baru ditulis (CPU+GPU wajib, sm_75); uji parsial CXX-only OK di sandbox; **lulus build + tes GPU di Colab T4** (TER GPU benar, memcheck 0 error, diferensial SS 0 mismatch); perbandingan waktu vs CPU-only belum tuntas | `CMakeLists.txt`, `tools/*` |
