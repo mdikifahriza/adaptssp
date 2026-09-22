@@ -155,6 +155,11 @@ struct TerResult {
 // compute_derived() for why this matters.
 TerParams ter_default_params(const std::vector<ter_u128>& weights);
 
+// Override jatah baris A yang diproses CPU di merge_level1 (fraksi 0.0..1.0).
+// Nilai >= 0 mematikan adaptasi EMA dan memakai fraksi tetap ini; -1.0
+// (default) = mode adaptif g_cpu_split_frac. Dipakai oleh --ter_cpu_frac.
+void ter_set_cpu_split_frac_override(double frac);
+
 // Main solver entry point.
 // weights/target are full 128-bit precision (ter_u128) so instances
 // with values or partial sums beyond 2^64 are handled correctly.

@@ -1039,6 +1039,7 @@ int main(int argc, char *argv[])
     double timeout_sec = 0.0;
     std::string solver = "ter";
     double mem_budget_gb = 0.0;
+    double ter_cpu_frac = -1.0;
     int extsol_swap_size = 4;
     size_t extsol_max_solutions = 1000;
 
@@ -1103,6 +1104,12 @@ int main(int argc, char *argv[])
         .help("TER: mode statistik. Tidak berhenti di solusi pertama; jalankan tepat --runs kali dan cetak "
               "success rate per run + profil per fase. Wajib dengan --runs N (N > 0), tidak bisa dengan --autorestart.")
         .flag();
+
+    program.add_argument("--ter_cpu_frac")
+        .store_into(ter_cpu_frac)
+        .help("TER: override jatah baris A yang diproses CPU di merge_level1 (fraksi 0.0..1.0). "
+              "-1 (default) = mode adaptif EMA. Bermanfaat untuk kalibrasi manual di mesin 2 core.")
+        .default_value(-1.0);
 
     program.add_argument("--ss_gpu")
         .help("SS: radix-sort quarter2/quarter4 (>65536 elemen) di GPU via cub::DeviceRadixSort, "
@@ -1237,6 +1244,8 @@ int main(int argc, char *argv[])
         }
 
         params.use_bucket_lookup = (program["--ter_bucket"] == true);
+        if (ter_cpu_frac >= 0.0)
+            ter_set_cpu_split_frac_override(ter_cpu_frac);
         if (program["--ter_stats"] == true)
         {
             if (runs <= 0 || program["--autorestart"] == true)

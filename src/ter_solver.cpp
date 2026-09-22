@@ -461,10 +461,18 @@ struct Level1Stats {
     size_t split_calls = 0;
 };
 
-static double g_cpu_split_frac = 0.05;
-static double g_cpu_split_frac_report() { return g_cpu_split_frac; }
+// Jatah CPU di merge_level1. Kalibrasi ulang P1: default 5% terlalu besar untuk
+// mesin 2 CPU core (membuat run pertama n=96 tersendat ~14 menit di slice CPU,
+// sementara GPU menganggur menunggunya). Untuk 1 CPU core perlu <0.5%; pakai
+// floor 0.05% supaya EMInya tidak sampai menyentuh nol (yang membuat GPU diuji
+// sendirian tanpa jatah CPU untuk kalibrasi rate).
+static double g_cpu_split_frac = 0.001;
+static double g_cpu_split_frac_override = -1.0;
+void ter_set_cpu_split_frac_override(double frac) { g_cpu_split_frac_override = (frac >= 0.0) ? frac : -1.0; }
+static double g_cpu_split_frac_active() { return (g_cpu_split_frac_override >= 0.0) ? g_cpu_split_frac_override : g_cpu_split_frac; }
+static double g_cpu_split_frac_report() { return g_cpu_split_frac_active(); }
 static constexpr size_t kGpuMinRows = 4096;
-static constexpr double kFracMin = 0.01, kFracMax = 0.50, kEmaAlpha = 0.5;
+static constexpr double kFracMin = 0.0005, kFracMax = 0.50, kEmaAlpha = 0.5;
 
 static bool build_level1_sidecar(
     const std::vector<TerEntry>& A, const std::vector<TerEntry>& B,
@@ -602,7 +610,7 @@ static void merge_level1(
 #ifdef WITH_GPU
     if (!A.empty() && !B.empty() && !sorted_C.empty()) {
         size_t total = A.size();
-        double frac = (total < kGpuMinRows) ? 0.0 : g_cpu_split_frac;
+        double frac = (total < kGpuMinRows) ? 0.0 : g_cpu_split_frac_active();
         size_t cpu_rows = (size_t)(frac * (double)total);
         size_t gpu_rows = total - cpu_rows;
 
@@ -638,14 +646,16 @@ static void merge_level1(
                 L1_out = std::move(gpu_out);
                 for (auto& e : cpu_out) { if (L1_out.size() >= max_cap) break; L1_out.push_back(e); }
 
-                if (cpu_rows > 0 && gpu_rows > 0 && t_cpu > 1e-6 && t_gpu > 1e-6) {
-                    double rate_cpu = (double)cpu_rows / t_cpu, rate_gpu = (double)gpu_rows / t_gpu;
-                    double target_frac = rate_cpu / (rate_cpu + rate_gpu);
-                    g_cpu_split_frac = kEmaAlpha * target_frac + (1.0 - kEmaAlpha) * g_cpu_split_frac;
-                } else if (cpu_rows == 0 && gpu_rows > 0) {
-                    g_cpu_split_frac = std::max(kFracMin, g_cpu_split_frac * 0.7);
+                if (g_cpu_split_frac_override < 0.0) {
+                    if (cpu_rows > 0 && gpu_rows > 0 && t_cpu > 1e-6 && t_gpu > 1e-6) {
+                        double rate_cpu = (double)cpu_rows / t_cpu, rate_gpu = (double)gpu_rows / t_gpu;
+                        double target_frac = rate_cpu / (rate_cpu + rate_gpu);
+                        g_cpu_split_frac = kEmaAlpha * target_frac + (1.0 - kEmaAlpha) * g_cpu_split_frac;
+                    } else if (cpu_rows == 0 && gpu_rows > 0) {
+                        g_cpu_split_frac = std::max(kFracMin, g_cpu_split_frac * 0.7);
+                    }
+                    g_cpu_split_frac = std::min(kFracMax, std::max(kFracMin, g_cpu_split_frac));
                 }
-                g_cpu_split_frac = std::min(kFracMax, std::max(kFracMin, g_cpu_split_frac));
                 stats.sum_cpu_frac += (double)cpu_rows / (double)total;
                 ++stats.split_calls;
                 return;
