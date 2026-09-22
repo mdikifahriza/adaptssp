@@ -36,36 +36,33 @@ __global__ void level1_merge_kernel(
     const TerEntry* __restrict__ d_C, size_t size_C, uint64_t target_mod, uint64_t mask_m1,
     TerEntry* __restrict__ d_out, unsigned long long* __restrict__ d_out_count, size_t max_out_capacity)
 {
-    const size_t total_pairs = size_A * size_B;
-    // Grid-stride loop: grid dilaunch dengan jumlah blok yang di-cap (lihat gpu_l1_launch),
-    // jadi satu thread bisa memproses banyak pasangan (i_a, i_b) secara berurutan. Ini
-    // menghilangkan ketergantungan pada gridDim.x <= 2^31-1 relatif terhadap total_pairs,
-    // yang sebelumnya membuat launch gagal untuk instance besar (n=96: total_pairs bisa
-    // mencapai ~10^12+, jauh di atas batas grid CUDA 1D).
-    const size_t stride = (size_t)gridDim.x * blockDim.x;
-    for (size_t pair_idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-         pair_idx < total_pairs;
-         pair_idx += stride)
-    {
-        size_t i_a = pair_idx / size_B;
-        size_t i_b = pair_idx % size_B;
-        TerEntry u = d_A[i_a];
-        TerEntry v = d_B[i_b];
-        uint64_t req_rem = (target_mod - ((uint64_t)(u.psum + v.psum) & mask_m1)) & mask_m1;
-        size_t low = 0, high = size_C;
-        while (low < high) {
-            size_t mid = low + (high - low) / 2;
-            uint64_t val = (uint64_t)d_C[mid].psum & mask_m1;
-            if (val < req_rem) low = mid + 1; else high = mid;
-        }
-        for (size_t k = low; k < size_C; ++k) {
-            uint64_t val = (uint64_t)d_C[k].psum & mask_m1;
-            if (val != req_rem) break;
-            TerEntry w = d_C[k];
-            TerEntry combined;
-            if (check_and_add_ternary_gpu(u, v, w, combined)) {
-                unsigned long long out_pos = atomicAdd(d_out_count, 1ULL);
-                if (out_pos < max_out_capacity) d_out[out_pos] = combined;
+    // 2D tiled loop: tiap blok menangani baris-baris A (i_a, stride gridDim.x), tiap
+    // thread di dalam blok menyapu kolom B (i_b, stride blockDim.x). Grid tetap di-cap di
+    // gpu_l1_launch, jadi tidak ada ketergantungan pada gridDim.x <= 2^31-1 relatif
+    // terhadap total_pairs = |A|*|B| (yang dulu membuat launch gagal untuk n=96, pair
+    // ~10^12+). Yang PALING penting: tidak ada pembagian/modulo 64-bit per pasangan —
+    // pair_idx / size_B dan pair_idx % size_B lebih lambat ~200+ cycle di Turing
+    // (T4 tidak punya integer-division 64-bit native), dan itu dieksekusi per pair.
+    for (size_t i_a = (size_t)blockIdx.x; i_a < size_A; i_a += (size_t)gridDim.x) {
+        const TerEntry u = d_A[i_a];
+        for (size_t i_b = (size_t)threadIdx.x; i_b < size_B; i_b += (size_t)blockDim.x) {
+            const TerEntry v = d_B[i_b];
+            uint64_t req_rem = (target_mod - ((uint64_t)(u.psum + v.psum) & mask_m1)) & mask_m1;
+            size_t low = 0, high = size_C;
+            while (low < high) {
+                size_t mid = low + (high - low) / 2;
+                uint64_t val = (uint64_t)d_C[mid].psum & mask_m1;
+                if (val < req_rem) low = mid + 1; else high = mid;
+            }
+            for (size_t k = low; k < size_C; ++k) {
+                uint64_t val = (uint64_t)d_C[k].psum & mask_m1;
+                if (val != req_rem) break;
+                TerEntry w = d_C[k];
+                TerEntry combined;
+                if (check_and_add_ternary_gpu(u, v, w, combined)) {
+                    unsigned long long out_pos = atomicAdd(d_out_count, 1ULL);
+                    if (out_pos < max_out_capacity) d_out[out_pos] = combined;
+                }
             }
         }
     }
@@ -78,36 +75,31 @@ __global__ void level1_merge_kernel_bucket(
     uint64_t target_mod, uint64_t mask_m1, TerEntry* __restrict__ d_out,
     unsigned long long* __restrict__ d_out_count, size_t max_out_capacity)
 {
-    const size_t total_pairs = size_A * size_B;
-    // Grid-stride loop: lihat catatan di level1_merge_kernel di atas — cap grid
-    // ditentukan oleh caller (gpu_l1_launch), loop di sini yang menutup sisanya.
-    const size_t stride = (size_t)gridDim.x * blockDim.x;
-    for (size_t pair_idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-         pair_idx < total_pairs;
-         pair_idx += stride)
-    {
-        size_t i_a = pair_idx / size_B;
-        size_t i_b = pair_idx % size_B;
+    // 2D tiled loop: sama seperti level1_merge_kernel — tanpa pembagian/modulo 64-bit
+    // per pasangan (lihat catatan di kernel di atas), dan grid tetap di-cap oleh caller.
+    for (size_t i_a = (size_t)blockIdx.x; i_a < size_A; i_a += (size_t)gridDim.x) {
+        const uint64_t a_ps = d_aps[i_a];
+        const TerEntry u = d_A[i_a];
+        for (size_t i_b = (size_t)threadIdx.x; i_b < size_B; i_b += (size_t)blockDim.x) {
+            const uint64_t req = (target_mod - a_ps - d_bps[i_b]) & mask_m1;
+            uint32_t bucket = (uint32_t)(req >> shift);
+            uint32_t end = d_start[bucket + 1];
+            uint32_t lo = d_start[bucket];
+            uint32_t hi = end;
+            while (lo < hi) {
+                uint32_t mid = lo + (hi - lo) / 2;
+                if (d_ckeys[mid] < req) lo = mid + 1; else hi = mid;
+            }
+            if (lo >= end || d_ckeys[lo] != req) continue;
 
-        uint64_t req = (target_mod - d_aps[i_a] - d_bps[i_b]) & mask_m1;
-        uint32_t bucket = (uint32_t)(req >> shift);
-        uint32_t end = d_start[bucket + 1];
-        uint32_t lo = d_start[bucket];
-        uint32_t hi = end;
-        while (lo < hi) {
-            uint32_t mid = lo + (hi - lo) / 2;
-            if (d_ckeys[mid] < req) lo = mid + 1; else hi = mid;
-        }
-        if (lo >= end || d_ckeys[lo] != req) continue;
-
-        TerEntry u = d_A[i_a];
-        TerEntry v = d_B[i_b];
-        for (uint32_t k = lo; k < end && d_ckeys[k] == req; ++k) {
-            TerEntry w = d_C[k];
-            TerEntry combined;
-            if (check_and_add_ternary_gpu(u, v, w, combined)) {
-                unsigned long long out_pos = atomicAdd(d_out_count, 1ULL);
-                if (out_pos < max_out_capacity) d_out[out_pos] = combined;
+            const TerEntry v = d_B[i_b];
+            for (uint32_t k = lo; k < end && d_ckeys[k] == req; ++k) {
+                const TerEntry w = d_C[k];
+                TerEntry combined;
+                if (check_and_add_ternary_gpu(u, v, w, combined)) {
+                    unsigned long long out_pos = atomicAdd(d_out_count, 1ULL);
+                    if (out_pos < max_out_capacity) d_out[out_pos] = combined;
+                }
             }
         }
     }
@@ -213,18 +205,16 @@ bool gpu_l1_launch(const std::vector<TerEntry>& A, const std::vector<TerEntry>& 
     // gagal, sehingga GPU tidak pernah benar-benar terpakai.
     if (a_count > SIZE_MAX / B.size()) { std::cerr << "[GPU] |A|*|B| overflow\n"; return false; }
     if (block_size < 32 || block_size > 1024 || (block_size % 32) != 0) block_size = 256;
-    const size_t total_pairs = a_count * B.size();
-    size_t grid = (total_pairs + (size_t)block_size - 1) / (size_t)block_size;
 
-    // Grid-stride: kernel sekarang loop internal atas pair_idx (lihat level1_merge_kernel /
-    // level1_merge_kernel_bucket), jadi grid TIDAK PERLU sama dengan total_pairs/block_size.
-    // Cap ke nilai aman yang jauh di bawah batas gridDim.x (2^31-1 blok) -- cukup untuk
-    // menyaturasi SM Tesla T4 (40 SM), sekaligus menghindari overhead scheduling blok
-    // yang sia-sia untuk grid raksasa. Sebelumnya baris ini adalah early-return yang
-    // menggagalkan seluruh launch untuk instance besar (mis. n=96, total_pairs ~10^12+);
-    // sekarang launch SELALU berhasil dari sisi ukuran grid, berapa pun besar total_pairs.
+    // Mapping 2D: blockIdx.x menunjuk baris A (i_a), threadIdx.x menyapu kolom B (i_b),
+    // jadi grid TIDAK perlu sebesar total_pairs/block_size. Cukup satu blok per baris A
+    // (plus stride gridDim.x di kernel untuk baris sisa), di-kap ke kMaxGridBlocks agar
+    // tidak melebihi batas gridDim.x (2^31-1) dan tidak ada overhead scheduling blok
+    // sia-sia untuk grid raksasa. Sebelumnya grid dihitung dari total_pairs yang bisa
+    // ~10^12+ untuk n=96 → di luar batas grid CUDA dan launch gagal.
     constexpr size_t kMaxGridBlocks = 131072;
-    if (grid > kMaxGridBlocks) grid = kMaxGridBlocks;
+    size_t grid = std::min(a_count, kMaxGridBlocks);
+    if (grid == 0) grid = 1;
 
     const bool bucket = (sidecar && sidecar->valid && sidecar->a_ps.size() == A.size() &&
                          sidecar->b_ps.size() == B.size() && sidecar->c_keys.size() == sorted_C.size() &&
