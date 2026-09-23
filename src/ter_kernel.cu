@@ -37,13 +37,6 @@ __global__ void level1_merge_kernel(
     const TerEntry* __restrict__ d_C, size_t size_C, uint64_t target_mod, uint64_t mask_m1,
     TerEntry* __restrict__ d_out, unsigned long long* __restrict__ d_out_count, size_t max_out_capacity)
 {
-    // 2D tiled loop: tiap blok menangani baris-baris A (i_a, stride gridDim.x), tiap
-    // thread di dalam blok menyapu kolom B (i_b, stride blockDim.x). Grid tetap di-cap di
-    // gpu_l1_launch, jadi tidak ada ketergantungan pada gridDim.x <= 2^31-1 relatif
-    // terhadap total_pairs = |A|*|B| (yang dulu membuat launch gagal untuk n=96, pair
-    // ~10^12+). Yang PALING penting: tidak ada pembagian/modulo 64-bit per pasangan —
-    // pair_idx / size_B dan pair_idx % size_B lebih lambat ~200+ cycle di Turing
-    // (T4 tidak punya integer-division 64-bit native), dan itu dieksekusi per pair.
     for (size_t i_a = (size_t)blockIdx.x; i_a < size_A; i_a += (size_t)gridDim.x) {
         const TerEntry u = d_A[i_a];
         for (size_t i_b = (size_t)threadIdx.x; i_b < size_B; i_b += (size_t)blockDim.x) {
@@ -76,8 +69,6 @@ __global__ void level1_merge_kernel_bucket(
     uint64_t target_mod, uint64_t mask_m1, TerEntry* __restrict__ d_out,
     unsigned long long* __restrict__ d_out_count, size_t max_out_capacity)
 {
-    // 2D tiled loop: sama seperti level1_merge_kernel — tanpa pembagian/modulo 64-bit
-    // per pasangan (lihat catatan di kernel di atas), dan grid tetap di-cap oleh caller.
     for (size_t i_a = (size_t)blockIdx.x; i_a < size_A; i_a += (size_t)gridDim.x) {
         const uint64_t a_ps = d_aps[i_a];
         const TerEntry u = d_A[i_a];
@@ -148,17 +139,13 @@ struct Session {
     cudaStream_t stream = nullptr;
     cudaEvent_t ev[4] = {nullptr, nullptr, nullptr, nullptr};
 
-    // P3: bank buffer cadangan (prefetch) — dipakai gpu_l1_prefetch() untuk menyalin
-    // triplet berikutnya secara async (stream kedua) SELAGIH kernel saat ini jalan,
-    // lalu gpu_l1_launch() menukarnya (swap) ke bank utama sehingga launch berikutnya
-    // tidak perlu menunggu H2D (h2d sudah overlap dengan kernel run sekarang).
     DevBuf pdA, pdB, pdC, pdOut, pdCnt, pdAps, pdBps, pdCk, pdSt;
     PinBuf phA, phB, phC, phAps, phBps, phCk, phSt, phCnt;
     cudaStream_t pref_stream = nullptr;
-    cudaEvent_t pref_ev[2] = {nullptr, nullptr}; // [0]=mulai H2D pref, [1]=selesai
+    cudaEvent_t pref_ev[2] = {nullptr, nullptr};
     cudaEvent_t pref_done = nullptr;
-    bool pref_ready = false;   // bank pref berisi data valid yang belum dikonsumsi
-    bool pref_used = false;    // job yang sekarang pending diluncurkan dari prefetch
+    bool pref_ready = false;
+    bool pref_used = false;
 
     struct PrefetchMeta {
         size_t a_count = 0, b_count = 0, c_count = 0, max_cap = 0;
@@ -180,10 +167,6 @@ template <class Buf>
 void swap_buf(Buf& a, Buf& b) { std::swap(a.p, b.p); std::swap(a.cap, b.cap); }
 
 void session_swap_banks(Session& s) {
-    // Tukar bank utama dengan bank prefetch agar job yang baru di-prefetch langsung
-    // menjadi bank "current" tanpa menyalin apa pun. CATATAN: tidak boleh memakai
-    // std::swap utuh pada DevBuf/PinBuf — copy-assignment lalu destruktor release()
-    // akan membebaskan buffer yang ternyata masih dipakai sisi lain (use-after-free).
     swap_buf(s.dA, s.pdA); swap_buf(s.dB, s.pdB); swap_buf(s.dC, s.pdC);
     swap_buf(s.dOut, s.pdOut); swap_buf(s.dCnt, s.pdCnt);
     swap_buf(s.dAps, s.pdAps); swap_buf(s.dBps, s.pdBps); swap_buf(s.dCk, s.pdCk); swap_buf(s.dSt, s.pdSt);
@@ -222,7 +205,7 @@ void session_release_all(Session& s) {
     s.stream = nullptr; s.pref_stream = nullptr; s.inited = false;
 }
 
-} // namespace
+}
 
 GpuMergeStats gpu_merge_stats_get() { GpuMergeStats s = g.stats; s.first_call_ms = g.first_ms; return s; }
 void gpu_merge_stats_reset() { g.stats = GpuMergeStats{}; g.first_done = false; g.first_ms = 0.0; }
@@ -241,8 +224,6 @@ bool gpu_l1_prefetch(const std::vector<TerEntry>& A, const std::vector<TerEntry>
     if (a_count == (size_t)-1 || a_count > A.size()) a_count = A.size();
     if (a_count == 0) return false;
     if (!session_init()) return false;
-    // Satu prefetch in-flight saja: job yang belum dikonsumsi berarti caller salah
-    // urutan (harus launch dulu yang memakai prefetch, baru prefetch berikutnya).
     if (g.pref_ready) return false;
     if (a_count > SIZE_MAX / B.size()) { std::cerr << "[GPU] |A|*|B| overflow (prefetch)\n"; return false; }
     if (block_size < 32 || block_size > 1024 || (block_size % 32) != 0) block_size = 256;
@@ -274,9 +255,6 @@ bool gpu_l1_prefetch(const std::vector<TerEntry>& A, const std::vector<TerEntry>
         std::memcpy(g.phSt.p, sidecar->start.data(), bSt);
     }
 
-    // Semua copy H2D + memset diletakkan di stream prefetch, paralel dgn kernel
-    // run sekarang yang masih jalan di g.stream. cudaStreamWaitEvent di
-    // gpu_l1_launch nanti memastikan copy selesai SEBELUM kernel berikutnya lahir.
     cudaStream_t ps = g.pref_stream;
     cudaEventRecord(g.pref_ev[0], ps);
     if (!cuda_ok(cudaMemcpyAsync(g.pdA.p, g.phA.p, bA, cudaMemcpyHostToDevice, ps), "pref h2d A")) return false;
@@ -309,14 +287,6 @@ bool gpu_l1_launch(const std::vector<TerEntry>& A, const std::vector<TerEntry>& 
     const auto t0 = clk::now();
     if (!session_init()) return false;
 
-    // NOTE (Bug fix): hanya A[0..a_count) yang dikirim ke GPU -- ini HARUS sama
-    // dengan `gpu_rows` yang dipakai caller (merge_level1 di ter_solver.cpp) untuk
-    // menghitung jatah baris CPU (A[a_count..A.size())), atau baris yang sama akan
-    // diproses dobel oleh CPU dan GPU sekaligus. Sebelumnya fungsi ini selalu memakai
-    // A.size() penuh, sehingga total_pairs/grid dihitung dari SELURUH A meski hanya
-    // sebagian yang seharusnya jadi jatah GPU -- untuk n besar (mis. n=96, |A|~1.6M)
-    // ini membuat grid meledak jauh di atas batas CUDA (2^31-1) dan launch selalu
-    // gagal, sehingga GPU tidak pernah benar-benar terpakai.
     if (a_count > SIZE_MAX / B.size()) { std::cerr << "[GPU] |A|*|B| overflow\n"; return false; }
     if (block_size < 32 || block_size > 1024 || (block_size % 32) != 0) block_size = 256;
 
@@ -324,9 +294,6 @@ bool gpu_l1_launch(const std::vector<TerEntry>& A, const std::vector<TerEntry>& 
                          sidecar->b_ps.size() == B.size() && sidecar->c_keys.size() == sorted_C.size() &&
                          !sidecar->start.empty());
 
-    // P3: konsumsi hasil prefetch bila job ini sudah di-stage di stream prefetch dan
-    // parameternya identik. Menukar bank buffer memindahkan data yang sudah ada di
-    // GPU ke "bank saat ini" tanpa menyalin apa pun di host.
     bool used_prefetch = false;
     if (g.pref_ready) {
         const auto& m = g.pref_meta;
@@ -341,18 +308,11 @@ bool gpu_l1_launch(const std::vector<TerEntry>& A, const std::vector<TerEntry>& 
             ++g.stats.pref_calls;
             used_prefetch = true;
         } else {
-            // Meta tidak cocok (mis. target_mod berganti) -> buang prefetch lama, jalan normal.
             cudaStreamSynchronize(g.pref_stream);
             g.pref_ready = false;
         }
     }
 
-    // Mapping 2D: blockIdx.x menunjuk baris A (i_a), threadIdx.x menyapu kolom B (i_b),
-    // jadi grid TIDAK perlu sebesar total_pairs/block_size. Cukup satu blok per baris A
-    // (plus stride gridDim.x di kernel untuk baris sisa), di-kap ke kMaxGridBlocks agar
-    // tidak melebihi batas gridDim.x (2^31-1) dan tidak ada overhead scheduling blok
-    // sia-sia untuk grid raksasa. Sebelumnya grid dihitung dari total_pairs yang bisa
-    // ~10^12+ untuk n=96 → di luar batas grid CUDA dan launch gagal.
     constexpr size_t kMaxGridBlocks = 131072;
     size_t grid = std::min(a_count, kMaxGridBlocks);
     if (grid == 0) grid = 1;
@@ -373,8 +333,6 @@ bool gpu_l1_launch(const std::vector<TerEntry>& A, const std::vector<TerEntry>& 
         }
         g.stats.alloc_ms += ms_since(ta, clk::now());
 
-        // A dan a_ps dipotong ke a_count baris pertama (jatah GPU); B dan sorted_C tetap utuh
-        // karena keduanya dipakai penuh baik oleh GPU maupun jatah CPU (lihat merge_level1).
         std::memcpy(g.hA.p, A.data(), bA);
         std::memcpy(g.hB.p, B.data(), bB);
         std::memcpy(g.hC.p, sorted_C.data(), bC);
@@ -401,7 +359,6 @@ bool gpu_l1_launch(const std::vector<TerEntry>& A, const std::vector<TerEntry>& 
         }
         cudaEventRecord(g.ev[1], s);
     } else {
-        // Data sudah di GPU dari stream prefetch; cukup tandai batas timing kernel.
         cudaEventRecord(g.ev[0], s);
         cudaEventRecord(g.ev[1], s);
     }

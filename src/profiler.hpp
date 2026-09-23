@@ -15,7 +15,6 @@ public:
         auto end_time = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> elapsed = end_time - start_time;
         total_times[section_name] += elapsed.count();
-        // std::cout << section_name << " measured " << elapsed.count() << "s\n";
     }
 
     double elapsed() const

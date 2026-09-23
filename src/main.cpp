@@ -152,9 +152,6 @@ std::vector<u128> parse_u128_tokens(const std::string &text)
     return values;
 }
 
-// Instance 1D subset-sum dalam format .prb:
-//   baris pertama: "1 n"
-//   baris kedua  : n nilai lalu target
 struct SubsetSum1D128
 {
     std::vector<u128> values;
@@ -191,19 +188,6 @@ bool can_fit_size_t(const SubsetSum1D128 &instance)
     if (instance.target > max_size_t)
         return false;
 
-    // Bug 2 (rencana.md §4.3): checking only that each individual value
-    // and the target fit in size_t is not enough. shroeppel_shamir_1d<uint64_t>
-    // internally sums many values (P[k]/S[k] windows in compute_k_window /
-    // compute_k_priority_profile, every subset-sum produced by
-    // generate_subsets, pair scores placed in the heap, and the final
-    // verification sum in print_and_write_1d_ss_solution). If the *total*
-    // of all values exceeds 2^64, those sums wrap silently: score < target
-    // comparisons can come out wrong (missing real solutions), and the
-    // final "sum != target" check is itself only correct modulo 2^64 (so
-    // it can also accept a false solution). Require the grand total,
-    // computed here at full u128 precision, to also fit size_t before the
-    // uint64_t path is used; otherwise callers must fall back to the
-    // (slower, not yet GPU-accelerated) u128 path.
     u128 total = 0;
     for (u128 value : instance.values)
     {
@@ -526,8 +510,6 @@ filter_by_cardinality(const std::vector<T> &weights, size_t k_lo, size_t k_hi)
         n_valid += ok;
     }
 
-    // +1 slot scratch: kompaksi branchless di bawah selalu menulis fw[out]/fm[out],
-    // termasuk untuk elemen tak valid setelah entri valid terakhir (out == n_valid).
     std::vector<T>      fw(n_valid + 1);
     std::vector<size_t> fm(n_valid + 1);
 
@@ -584,7 +566,7 @@ bool print_and_write_1d_ss_solution(size_t index_list1, size_t index_list2, size
     }
 
     if (solution_out)
-        *solution_out = indices; // indeks asli (list1..list4 adalah potongan berurutan dari values)
+        *solution_out = indices;
 
     std::cout << "Found subset-sum solution from Schroeppel-Shamir!\n";
     std::cout << "Bitstring: " << bitstring << "\n";
@@ -877,15 +859,12 @@ std::string get_filename_without_extension(const std::string &filePath)
     return filePath.substr(start, end - start);
 }
 
-// --extsol (rencana.md §9): setelah solver menemukan satu solusi, jelajahi solusi lain yang
-// TERHUBUNG lewat swap nol-jumlah (zero_sum_swap.h). Hasil ditulis ke <instance>.extsol,
-// satu bitstring per baris; baris pertama = solusi awal (sama dengan isi .sol).
 static void run_extsol(const std::vector<u128> &values, u128 target, const std::vector<size_t> &initial,
                        const std::string &instance_name, int swap_size, size_t max_solutions)
 {
     SwapExploreParams P;
     P.max_swap_size = swap_size;
-    P.max_solutions = max_solutions; // 0 = tanpa batas
+    P.max_solutions = max_solutions;
     P.verbose = true;
 
     ScopedProfiler prof("Extsol (zero-sum swap)     ");
@@ -1088,9 +1067,6 @@ int main(int argc, char *argv[])
         std::cout << " (auto-detected)";
     std::cout << std::endl;
 
-    // K1 (rencana.md §10): the old m x n adaptsspFeas pipeline is gone.
-    // Path instance adalah argumen posisional (wajib, di-enforce oleh argparse)
-    // dan harus bernama instance subset-sum 1D berformat .prb.
     const std::string instance_name = get_filename_without_extension(path);
     printf("Reading instance from file %s; instance_name %s\n", path.c_str(), instance_name.c_str());
 
@@ -1112,7 +1088,7 @@ int main(int argc, char *argv[])
     }
 
     bool found = false;
-    std::vector<size_t> solution_indices; // solusi awal untuk --extsol (indeks asli 0-based)
+    std::vector<size_t> solution_indices;
     std::vector<uint64_t> vals64;
     vals64.reserve(instance_1d.values.size());
     for (const auto &v : instance_1d.values)
@@ -1187,9 +1163,6 @@ int main(int argc, char *argv[])
         }
         else
         {
-            // TER is heuristic/probabilistic, not exhaustive (rencana.md
-            // §4.4): a run that doesn't find a solution is not proof of
-            // infeasibility, so the message must not claim that.
             printf("TER: tidak ditemukan dalam %d run (%.3f s) -- ini BUKAN bukti infeasible. "
                    "Gunakan --autorestart untuk terus mencoba.\n", res.runs_attempted, res.elapsed_seconds);
         }
@@ -1207,8 +1180,6 @@ int main(int argc, char *argv[])
 
     if (solver != "ter")
     {
-        // SS is exhaustive only when k_radius == -1 (rencana.md §4.4); a
-        // restricted k_radius only searched a window around peak_k.
         if (found)
             printf("Found feasible solution!\n");
         else if (k_radius < 0)

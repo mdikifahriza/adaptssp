@@ -1,26 +1,5 @@
 #pragma once
 
-// Explorer solusi subset-sum lewat "zero-sum swap" (BFS bertingkat), native untuk project ini.
-// Rencana: rencana.md §4.2 dan §9. Tidak bergantung pada solver_header.h milik program lain.
-//
-// Ide: dari satu solusi awal S (himpunan indeks), solusi baru didapat dengan
-//   - membuang subset I dari S (I subset S, |I| <= max_swap_size), dan
-//   - menambah subset O dari luar S (O disjoint dari S, |O| <= max_swap_size),
-// dengan sum(I) == sum(O). Jumlah total tetap sama dengan target.
-//   Tier 0 = solusi awal; Tier k = solusi baru hasil swap dari Tier k-1; berhenti saat
-//   satu tier tidak menghasilkan solusi baru (closure) atau salah satu batas tercapai.
-//
-// BATAS (harus disampaikan ke pengguna):
-//   - Yang dijelajahi hanya solusi yang TERHUBUNG dari solusi awal lewat rantai swap
-//     berukuran <= max_swap_size per sisi. Closure BUKAN bukti bahwa tidak ada solusi lain.
-//   - Biaya per node ~ C(|S|, <=m) + C(n-|S|, <=m). max_solutions dan max_subsets_per_side
-//     adalah pengaman keras; kalau kena, hasil ditandai capped (bukan closure).
-//
-// Ketepatan: semua jumlah subset dihitung eksak dalam u128 (dijamin tidak overflow karena
-// total seluruh nilai dicek <= 2^128-1 di awal), pencocokan memakai kesamaan jumlah eksak,
-// dan setiap kandidat tetap DIVERIFIKASI ulang dari nilai asli (sum == target) sebelum
-// diterima. Solusi awal juga divalidasi (indeks unik, dalam rentang, sum == target).
-
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -37,8 +16,8 @@ constexpr int kMaxSwapSize = 6;
 
 struct SwapWitness
 {
-    std::vector<size_t> indices; // terurut naik, unik
-    u128 sum = 0;                // presisi penuh, selalu == target
+    std::vector<size_t> indices;
+    u128 sum = 0;
 };
 
 struct SwapTierInfo
@@ -50,23 +29,23 @@ struct SwapTierInfo
 
 struct SwapExploreParams
 {
-    int max_swap_size = 4;                     // 1..kMaxSwapSize, ukuran maksimum subset per sisi
-    int max_tiers = 100000;                    // pengaman jumlah generasi
-    size_t max_solutions = 1000;               // termasuk solusi awal; 0 = tanpa batas
-    size_t max_subsets_per_side = 5000000;     // pengaman memori/waktu per node
+    int max_swap_size = 4;
+    int max_tiers = 100000;
+    size_t max_solutions = 1000;
+    size_t max_subsets_per_side = 5000000;
     bool verbose = true;
 };
 
 struct SwapExploreResult
 {
-    std::vector<SwapWitness> all_solutions; // [0] = solusi awal
+    std::vector<SwapWitness> all_solutions;
     std::vector<SwapTierInfo> tiers;
     int tiers_run = 0;
-    bool capped = true;        // false HANYA bila closure tercapai tanpa node yang dilewati
-    size_t skipped_nodes = 0;  // node dilewati karena jumlah subset > max_subsets_per_side
-    size_t verify_failures = 0; // kandidat lolos pencocokan tapi gagal verifikasi (seharusnya 0)
+    bool capped = true;
+    size_t skipped_nodes = 0;
+    size_t verify_failures = 0;
     std::string stop_reason;
-    std::string error;         // tidak kosong => explorer tidak dijalankan
+    std::string error;
 };
 
 namespace swap_detail
@@ -75,11 +54,10 @@ namespace swap_detail
 struct Sub
 {
     u128 sum;
-    uint32_t pos[kMaxSwapSize]; // posisi di dalam pool sisi tsb (bukan indeks asli)
+    uint32_t pos[kMaxSwapSize];
     uint8_t cnt;
 };
 
-// true bila sum_{k=0..m} C(n,k) <= limit
 inline bool subset_count_within(size_t n, int m, size_t limit)
 {
     u128 total = 1, term = 1;
@@ -108,7 +86,6 @@ inline void gen_subsets(const std::vector<u128> &pool_vals, size_t start, int de
     }
 }
 
-// Mengembalikan true bila max_solutions tercapai (proses harus berhenti).
 inline bool swap_from_one(const std::vector<u128> &values, u128 target, const SwapWitness &base,
                           const SwapExploreParams &P, std::set<std::vector<size_t>> &seen,
                           SwapExploreResult &R, std::vector<SwapWitness> &newly)
@@ -225,7 +202,7 @@ inline bool swap_from_one(const std::vector<u128> &values, u128 target, const Sw
     return false;
 }
 
-} // namespace swap_detail
+}
 
 inline SwapExploreResult explore_zero_sum_swaps(const std::vector<u128> &values, u128 target,
                                                 const std::vector<size_t> &initial_indices,

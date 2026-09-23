@@ -43,10 +43,8 @@ target_include_directories(adaptssp PRIVATE
     ${ARGPARSE_INCLUDE_DIR}
 )
 
-# GPU wajib: makro ini dipakai guard #ifdef di ter_solver.cpp / ter_kernel.*
 target_compile_definitions(adaptssp PRIVATE WITH_GPU)
 
-# Xeon Broadwell (AVX2/BMI2/FMA, tanpa AVX-512) dan Tesla T4 (sm_75)
 target_compile_options(adaptssp PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-march=broadwell>
     $<$<COMPILE_LANGUAGE:CXX>:-mtune=broadwell>
@@ -55,17 +53,11 @@ target_compile_options(adaptssp PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
 )
 
-# Dua file .cu (ter_kernel.cu, ss_kernel.cu), tidak ada simbol __device__/__constant__
-# yang dibagi lintas file, jadi separable compilation tidak diperlukan.
 set_target_properties(adaptssp PROPERTIES
     CUDA_ARCHITECTURES 75
     CUDA_SEPARABLE_COMPILATION OFF
 )
 
-# LTO (rencana.md §10): default OFF karena belum pernah diuji dengan nvcc. Sekarang hanya ada satu
-# .cu (tabrakan fatbinData multi-.cu yang dulu mematikan LTO sudah tidak relevan). Coba di Colab:
-#   cmake -S . -B build -DENABLE_LTO=ON && cmake --build build -j2
-# LTO hanya mencakup unit C++ (bukan .cu); bandingkan hasil/waktu dengan build biasa.
 option(ENABLE_LTO "Aktifkan LTO untuk unit C++ (uji dulu di Colab)" OFF)
 if(ENABLE_LTO)
     include(CheckIPOSupported)
