@@ -152,100 +152,14 @@ std::vector<u128> parse_u128_tokens(const std::string &text)
     return values;
 }
 
+// Instance 1D subset-sum dalam format .prb:
+//   baris pertama: "1 n"
+//   baris kedua  : n nilai lalu target
 struct SubsetSum1D128
 {
     std::vector<u128> values;
     u128 target = 0;
-    std::vector<size_t> planted_indices;
-    std::string source_format;
-
-    bool has_planted_solution() const
-    {
-        return !planted_indices.empty();
-    }
-
-    bool verify_planted_solution() const
-    {
-        u128 sum = 0;
-        for (size_t idx : planted_indices)
-        {
-            if (idx >= values.size())
-                return false;
-            sum += values[idx];
-        }
-        return sum == target;
-    }
 };
-
-bool load_hgj_txt_instance(const std::string &path, SubsetSum1D128 &instance)
-{
-    std::ifstream file(path);
-    if (!file.is_open())
-        return false;
-
-    instance = {};
-    instance.source_format = "txt";
-
-    std::string line;
-    bool saw_target = false;
-    bool reading_planted = false;
-    std::string planted_text;
-
-    while (std::getline(file, line))
-    {
-        if (!line.empty() && line.back() == '\r')
-            line.pop_back();
-
-        const size_t target_pos = line.find("Target T");
-        if (target_pos != std::string::npos)
-        {
-            const size_t colon_pos = line.find(':', target_pos);
-            if (colon_pos != std::string::npos)
-            {
-                instance.target = parse_u128_decimal(line.substr(colon_pos + 1));
-                saw_target = true;
-            }
-            continue;
-        }
-
-        if (line.find("planted solution indices") != std::string::npos)
-        {
-            reading_planted = true;
-            planted_text += line;
-            planted_text += ' ';
-            if (line.find(']') != std::string::npos)
-                reading_planted = false;
-            continue;
-        }
-
-        if (reading_planted)
-        {
-            planted_text += line;
-            planted_text += ' ';
-            if (line.find(']') != std::string::npos)
-                reading_planted = false;
-            continue;
-        }
-
-        const size_t comment_pos = std::min(line.find('#'), line.find("//"));
-        const std::string data_part = (comment_pos == std::string::npos) ? line : line.substr(0, comment_pos);
-        auto values = parse_u128_tokens(data_part);
-        instance.values.insert(instance.values.end(), values.begin(), values.end());
-    }
-
-    if (!planted_text.empty())
-    {
-        const size_t open = planted_text.find('[');
-        const size_t close = planted_text.find(']');
-        if (open != std::string::npos && close != std::string::npos && close > open)
-        {
-            for (u128 value : parse_u128_tokens(planted_text.substr(open + 1, close - open - 1)))
-                instance.planted_indices.push_back(static_cast<size_t>(value));
-        }
-    }
-
-    return saw_target && !instance.values.empty();
-}
 
 bool load_prb_1d128_instance(const std::string &path, SubsetSum1D128 &instance)
 {
@@ -264,7 +178,6 @@ bool load_prb_1d128_instance(const std::string &path, SubsetSum1D128 &instance)
         return false;
 
     instance = {};
-    instance.source_format = "prb";
     instance.values.reserve(n);
     for (size_t i = 0; i < n; ++i)
         instance.values.push_back(tokens[2 + i]);
@@ -301,18 +214,6 @@ bool can_fit_size_t(const SubsetSum1D128 &instance)
             return false;
     }
     return true;
-}
-
-void write_1d_prb(const SubsetSum1D128 &instance, const std::string &path)
-{
-    std::ofstream file(path);
-    if (!file.is_open())
-        throw std::runtime_error("Could not open output prb file");
-
-    file << "1 " << instance.values.size() << "\n";
-    for (u128 value : instance.values)
-        file << value << " ";
-    file << instance.target << "\n";
 }
 
 size_t highestSetBit(size_t value)
@@ -1033,7 +934,6 @@ int main(int argc, char *argv[])
     std::string path = "";
     size_t n_threads = 0;
     bool check_only = false;
-    bool write_prb = false;
     int k_radius = -1;
     int runs = 0;
     double timeout_sec = 0.0;
@@ -1051,16 +951,12 @@ int main(int argc, char *argv[])
         .default_value(0);
 
     program.add_argument("--check_only")
-        .help("Only parse and verify input metadata/planted witness; do not solve.")
+        .help("Only parse and verify input metadata; do not solve.")
         .flag();
 
-    program.add_argument("--write_prb")
-        .help("Write parsed 1D txt/prb input back as MarketShareGpu-style .prb.")
-        .flag();
-
-    program.add_argument("-f", "--file")
+    program.add_argument("instance")
         .store_into(path)
-        .help("Path to a 1D subset-sum instance (.txt in HGJ format, or .prb). Required.")
+        .help("Path ke instance subset-sum 1D dalam format .prb ('1 n v1 v2 ... vn target'). Wajib.")
         .required();
 
     program.add_argument("--max_pairs")
@@ -1167,7 +1063,6 @@ int main(int argc, char *argv[])
     }
 
     check_only = (program["--check_only"] == true);
-    write_prb = (program["--write_prb"] == true);
 
     if (!program.is_used("--max_pairs"))
     {
@@ -1194,36 +1089,21 @@ int main(int argc, char *argv[])
     std::cout << std::endl;
 
     // K1 (rencana.md §10): the old m x n MarkShareFeas pipeline is gone.
-    // -f is required (enforced above by argparse) and must name a 1D
-    // subset-sum instance; there is no more fallback to a matrix format.
+    // Path instance adalah argumen posisional (wajib, di-enforce oleh argparse)
+    // dan harus bernama instance subset-sum 1D berformat .prb.
     const std::string instance_name = get_filename_without_extension(path);
     printf("Reading instance from file %s; instance_name %s\n", path.c_str(), instance_name.c_str());
 
     SubsetSum1D128 instance_1d;
-    if (!load_hgj_txt_instance(path, instance_1d) && !load_prb_1d128_instance(path, instance_1d))
+    if (!load_prb_1d128_instance(path, instance_1d))
     {
-        std::cerr << "Error: '" << path << "' is not a recognized 1D subset-sum instance "
-                     "(expected HGJ .txt format with a 'Target T' line, or a '1 n v1 v2 ... vn target' .prb file). "
-                     "Matrix (m x n MarkShareFeas) input is no longer supported.\n";
+        std::cerr << "Error: '" << path << "' is not a 1D subset-sum .prb instance "
+                     "(expected format '1 n v1 v2 ... vn target').\n";
         std::exit(1);
     }
 
-    std::cout << "Detected 1D subset-sum instance (" << instance_1d.source_format << "): n="
+    std::cout << "Detected 1D subset-sum instance: n="
               << instance_1d.values.size() << ", target=" << instance_1d.target << "\n";
-
-    if (instance_1d.has_planted_solution())
-    {
-        std::cout << "Planted witness: " << instance_1d.planted_indices.size()
-                  << " indices, verify="
-                  << (instance_1d.verify_planted_solution() ? "OK" : "FAILED") << "\n";
-    }
-
-    if (write_prb)
-    {
-        const std::string prb_name = instance_name + ".prb";
-        write_1d_prb(instance_1d, prb_name);
-        std::cout << "Wrote PRB: " << prb_name << "\n";
-    }
 
     if (check_only)
     {
