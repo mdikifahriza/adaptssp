@@ -929,7 +929,7 @@ static void run_extsol(const std::vector<u128> &values, u128 target, const std::
 
 int main(int argc, char *argv[])
 {
-    argparse::ArgumentParser program("markshare");
+    argparse::ArgumentParser program("adaptssp");
 
     std::string path = "";
     size_t n_threads = 0;
@@ -1088,7 +1088,7 @@ int main(int argc, char *argv[])
         std::cout << " (auto-detected)";
     std::cout << std::endl;
 
-    // K1 (rencana.md §10): the old m x n MarkShareFeas pipeline is gone.
+    // K1 (rencana.md §10): the old m x n adaptsspFeas pipeline is gone.
     // Path instance adalah argumen posisional (wajib, di-enforce oleh argparse)
     // dan harus bernama instance subset-sum 1D berformat .prb.
     const std::string instance_name = get_filename_without_extension(path);
