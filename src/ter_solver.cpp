@@ -105,8 +105,14 @@ void TerParams::compute_derived() {
         ? 128
         : bit_width_u128(2 * total_weight_sum + 1);
 
+    const int sum_range_bits = (total_weight_sum == 0)
+        ? 128
+        : bit_width_u128(total_weight_sum) - 1;
+
     b2 = std::max(1, std::min(b2_raw, usable_bits));
-    b1 = std::max(b2 + 2, std::min(b1_raw, usable_bits));
+
+    int b1_upper = std::min(b1_raw, std::max(b2 + 2, sum_range_bits));
+    b1 = std::max(b2 + 2, std::min(b1_upper, usable_bits));
 }
 
 TerParams ter_default_params(const std::vector<ter_u128>& weights) {
@@ -450,14 +456,14 @@ static void append_capped(std::vector<TerEntry>& out, const std::vector<std::vec
 static void merge_level1(
     const std::vector<TerEntry>& A, const std::vector<TerEntry>& B, const std::vector<TerEntry>& sorted_C,
     uint64_t s1, int b1, size_t max_cap, std::vector<TerEntry>& L1_out,
-    std::vector<std::vector<TerEntry>>& local_outs_scratch, bool use_bucket, Level1Sidecar& sc, Level1Stats& stats)
+    std::vector<std::vector<TerEntry>>& local_outs_scratch, Level1Sidecar& sc, Level1Stats& stats)
 {
     uint64_t mask_m1 = (1ULL << b1) - 1ULL;
     uint64_t target_mod = s1 & mask_m1;
     stats.pairs += A.size() * B.size();
 
     bool sc_ok = false;
-    if (use_bucket && !A.empty() && !B.empty() && !sorted_C.empty()) {
+    if (!A.empty() && !B.empty() && !sorted_C.empty()) {
         const auto t0 = std::chrono::high_resolution_clock::now();
         sc_ok = build_level1_sidecar(A, B, sorted_C, mask_m1, b1, sc);
         stats.sidecar_sec += std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count();
@@ -639,13 +645,28 @@ TerResult ter_solve(
         std::cout << "Instance size n : " << n << "\n";
         std::cout << "Target value    : " << ter_u128_to_string(target) << "\n";
         std::cout << "Matching bits   : b1=" << params.b1 << ", b2=" << params.b2 << "\n";
+        {
+            const int total_bits = bit_width_u128(params.total_weight_sum);
+            const long double ratio = total_bits > params.b1
+                ? std::ldexp(1.0L, total_bits - params.b1)
+                : 1.0L / std::ldexp(1.0L, params.b1 - total_bits);
+            if (ratio < 1.0L) {
+                std::cout << "[WARN] total_sum/2^b1 = " << ratio
+                          << " < 1: modulus L1 terlalu besar untuk jangkauan subset-sum,\n"
+                          << "       berisiko L1 kosong dan banyak run restart "
+                          << "(b1 diturunkan ke floor(log2(total)) kalau belum).\n";
+            } else {
+                std::cout << "Sum-wrap check  : total_sum/2^b1 >= 1 (b1=" << params.b1
+                          << ", sum_bits=" << total_bits << "): subset-sum membungkus modulus L1.\n";
+            }
+        }
         std::cout << "Target capacities: L3=" << target_L3 << ", L2=" << target_L2 << ", L1=" << target_L1 << "\n";
 #ifdef WITH_GPU
         std::cout << "Execution mode  : Hybrid CPU (OpenMP) + GPU (Tesla T4 / CUDA) for Level 1 merge\n";
 #else
         std::cout << "Execution mode  : CPU (OpenMP Multithreaded)\n";
 #endif
-        std::cout << "Level 1 lookup  : " << (params.use_bucket_lookup ? "sidecar key + bucket (--ter_bucket)" : "binary search (default)") << "\n";
+        std::cout << "Level 1 lookup  : sidecar key + bucket (auto; fallback binary search jika syarat bucket tidak terpenuhi)\n";
         std::cout << "Restart config  : fixed_runs=" << params.fixed_runs
                   << ", max_restarts=" << params.max_restarts
                   << ", timeout=" << params.timeout_seconds << "s"
@@ -805,7 +826,7 @@ TerResult ter_solve(
                 L2buf[cur_buf][3 * j + 0], L2buf[cur_buf][3 * j + 1], L2buf[cur_buf][3 * j + 2],
                 s1[j], params.b1, l1_cap, L1[j],
                 level1_scratch[j],
-                params.use_bucket_lookup, sidecar, l1_stats
+                sidecar, l1_stats
             );
             const auto a2 = clk::now();
             run_l1 += secs(a1, a2);

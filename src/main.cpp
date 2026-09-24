@@ -972,11 +972,6 @@ int main(int argc, char *argv[])
         .help("Solver engine for 1D subset sum: 'ter' (Li et al. 2025 Ternary) or 'ss' (Schroeppel-Shamir). Default: 'ter'")
         .default_value(std::string("ter"));
 
-    program.add_argument("--ter_bucket")
-        .help("TER: pakai sidecar key + bucket lookup di merge_level1 (CPU dan GPU) menggantikan binary search. "
-              "Hasil harus sama; default mati supaya bisa dibandingkan.")
-        .flag();
-
     program.add_argument("--ter_stats")
         .help("TER: mode statistik. Tidak berhenti di solusi pertama; jalankan tepat --runs kali dan cetak "
               "success rate per run + profil per fase. Wajib dengan --runs N (N > 0), tidak bisa dengan --autorestart.")
@@ -1115,7 +1110,6 @@ int main(int argc, char *argv[])
             params.fixed_runs = 1;
         }
 
-        params.use_bucket_lookup = (program["--ter_bucket"] == true);
         if (ter_cpu_frac >= 0.0)
             ter_set_cpu_split_frac_override(ter_cpu_frac);
         if (ter_b2_extra > 0)

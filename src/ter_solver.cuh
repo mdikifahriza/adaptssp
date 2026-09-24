@@ -50,7 +50,6 @@ struct TerParams {
 
     double heartbeat_seconds = 0.0;
 
-    bool   use_bucket_lookup;
     bool   continue_after_found;
 
     void compute_derived();
