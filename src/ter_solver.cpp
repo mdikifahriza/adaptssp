@@ -632,8 +632,8 @@ TerResult ter_solve(
     size_t target_L3 = params.target_L3;
     size_t target_L2 = params.target_L2;
     size_t target_L1 = params.target_L1;
-    const size_t l2_cap = target_L2 * 2;
-    const size_t l1_cap = target_L1 * 2;
+    const size_t l2_cap = target_L2 * 4;
+    const size_t l1_cap = target_L1 * 4;
 
     const bool keep_going = params.continue_after_found &&
                             (params.fixed_runs > 0 || params.max_restarts > 0 || params.timeout_seconds > 0.0);
