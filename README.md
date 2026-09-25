@@ -15,12 +15,10 @@ Once the first solution is found, the application can explore other solutions co
 
 To try it:
 
-1. Download this repository (`adaptssp`).
-2. Download `runcollab.ipynb` from the repository root.
-3. Open [Google Colab](https://colab.research.google.com/), then use **File → Upload notebook** and select `runcollab.ipynb`.
-4. In the Colab menu, choose **Runtime → Change runtime type**, set **Hardware accelerator** to **T4 GPU**, then click **Save**.
-5. Choose **Runtime → Run all** and wait for the cells to finish.
-6. The last cell zips every generated `*.sol` file and downloads `sol_files.zip` to your machine.
+1. Download `runcollab.ipynb` from the repository root.
+2. Open [Google Colab](https://colab.research.google.com/), then use **File → Upload notebook** and select `runcollab.ipynb`.
+3. In the Colab menu, choose **Runtime → Change runtime type**, set **Hardware accelerator** to **T4 GPU**, then click **Save**.
+5. Run all cells
 
 You can also open the ready-made notebook directly:
 
@@ -37,7 +35,6 @@ You can also open the ready-made notebook directly:
 | 5 | *This may take longer* | Runs the same command on `instance_n48` and `instance_n56`; `--autorestart` keeps retrying until a solution is found. |
 | 6 | *download all soll files* | Finds every `*.sol` file, packs them into `sol_files.zip`, and downloads it. |
 
-The notebook metadata already requests a GPU runtime with `gpuType: T4`, so step 4 above only has to be confirmed once after uploading.
 
 ## Running from the CLI
 
