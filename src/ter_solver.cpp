@@ -580,15 +580,11 @@ static bool merge_root_and_solve(
                 if (ver_sum == target) {
                     ++verified_count;
                     sol_indices = cur_indices;
+                    break;
                 }
             }
+            return verified_count > 0;
         }
-        std::cerr << "[ROOT-GPU-DEBUG] sidecar_ok=" << sidecar_ok
-                  << " gpu_ok=" << gpu_ok
-                  << " candidates=" << gpu_candidates.size()
-                  << " verified=" << verified_count
-                  << " |A|=" << L1_A.size() << " |B|=" << L1_B.size() << " |C|=" << L1_C.size() << "\n";
-        if (verified_count > 0) return true;
     }
 #endif
 
