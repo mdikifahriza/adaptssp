@@ -545,14 +545,72 @@ static bool merge_root_and_solve(
 ) {
     if (L1_A.empty() || L1_B.empty() || L1_C.empty()) return false;
 
+    std::vector<TerEntry> sorted_B = L1_B;
+    std::sort(sorted_B.begin(), sorted_B.end(), [](const TerEntry& x, const TerEntry& y) {
+        return x.psum < y.psum;
+    });
+
     sorted_C_scratch = L1_C;
     std::sort(sorted_C_scratch.begin(), sorted_C_scratch.end(), [](const TerEntry& x, const TerEntry& y) {
         return x.psum < y.psum;
     });
     const auto& sorted_C = sorted_C_scratch;
-
     uint64_t target_u64 = lo64(target);
+
+#ifdef WITH_GPU
+    {
+        Level1Sidecar sc_root;
+        if (build_level1_sidecar(L1_A, L1_B, sorted_C, ~0ULL, 64, sc_root)) {
+            std::vector<TerEntry> gpu_candidates;
+            bool gpu_ok = run_root_merge_gpu(L1_A, L1_B, sorted_C, target_u64, 64, sc_root, gpu_candidates);
+            if (gpu_ok) {
+                for (const auto& out : gpu_candidates) {
+                    std::vector<size_t> cur_indices;
+                    ter_u128 ver_sum = 0;
+                    for (int i = 0; i < n; ++i) {
+                        bool bit_is_one = false;
+                        if (i < 64) bit_is_one = (out.pos_lo & (1ULL << i)) != 0;
+                        else bit_is_one = (out.pos_hi & (1ULL << (i - 64))) != 0;
+                        if (bit_is_one) { cur_indices.push_back(i); ver_sum += weights[i]; }
+                    }
+                    if (ver_sum == target) {
+                        sol_indices = cur_indices;
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+#endif
+
     std::atomic<bool> found{false};
+
+    auto try_emit = [&](const TerEntry& u, const TerEntry& v, const TerEntry& w) -> bool {
+        TerEntry out{};
+        if (!check_root_sum(u, v, w, out)) return false;
+
+        std::vector<size_t> cur_indices;
+        ter_u128 ver_sum = 0;
+        for (int i = 0; i < n; ++i) {
+            bool bit_is_one = false;
+            if (i < 64) bit_is_one = (out.pos_lo & (1ULL << i)) != 0;
+            else bit_is_one = (out.pos_hi & (1ULL << (i - 64))) != 0;
+
+            if (bit_is_one) {
+                cur_indices.push_back(i);
+                ver_sum += weights[i];
+            }
+        }
+
+        if (ver_sum != target) return false;
+
+        bool expected = false;
+        if (found.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            #pragma omp critical
+            { sol_indices = cur_indices; }
+        }
+        return true;
+    };
 
     #pragma omp parallel
     {
@@ -560,50 +618,38 @@ static bool merge_root_and_solve(
         for (int i_a = 0; i_a < (int)L1_A.size(); ++i_a) {
             if (found.load(std::memory_order_relaxed)) continue;
             const TerEntry& u = L1_A[i_a];
+            const uint64_t req = target_u64 - u.psum;
 
+            size_t i = 0;
+            size_t j = sorted_C.size();
             bool local_break = false;
-            for (const auto& v : L1_B) {
+
+            while (i < sorted_B.size() && j > 0 && !local_break) {
                 if (found.load(std::memory_order_relaxed)) { local_break = true; break; }
 
-                uint64_t uv_sum = u.psum + v.psum;
-                uint64_t req_w = target_u64 - uv_sum;
+                const uint64_t vsum = sorted_B[i].psum;
+                const uint64_t wsum = sorted_C[j - 1].psum;
+                const uint64_t pair_sum = vsum + wsum;
 
-                auto it = std::lower_bound(sorted_C.begin(), sorted_C.end(), req_w,
-                    [](const TerEntry& elem, uint64_t val) {
-                        return elem.psum < val;
-                    });
+                if (pair_sum < req) {
+                    ++i;
+                } else if (pair_sum > req) {
+                    --j;
+                } else {
+                    
+                    size_t ie = i;
+                    while (ie < sorted_B.size() && sorted_B[ie].psum == vsum) ++ie;
+                    size_t jb = j;
+                    while (jb > 0 && sorted_C[jb - 1].psum == wsum) --jb;
 
-                while (it != sorted_C.end() && it->psum == req_w) {
-                    TerEntry out{};
-                    if (check_root_sum(u, v, *it, out)) {
-                        std::vector<size_t> cur_indices;
-                        ter_u128 ver_sum = 0;
-                        for (int i = 0; i < n; ++i) {
-                            bool bit_is_one = false;
-                            if (i < 64) bit_is_one = (out.pos_lo & (1ULL << i)) != 0;
-                            else bit_is_one = (out.pos_hi & (1ULL << (i - 64))) != 0;
+                    for (size_t a = i; a < ie && !local_break; ++a)
+                        for (size_t b = jb; b < j; ++b)
+                            if (try_emit(u, sorted_B[a], sorted_C[b])) { local_break = true; break; }
 
-                            if (bit_is_one) {
-                                cur_indices.push_back(i);
-                                ver_sum += weights[i];
-                            }
-                        }
-
-                        if (ver_sum == target) {
-                            bool expected = false;
-                            if (found.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-                                #pragma omp critical
-                                { sol_indices = cur_indices; }
-                            }
-                            local_break = true;
-                            break;
-                        }
-                    }
-                    ++it;
+                    i = ie;
+                    j = jb;
                 }
-                if (local_break) break;
             }
-            (void)local_break;
         }
     }
 
@@ -632,8 +678,11 @@ TerResult ter_solve(
     size_t target_L3 = params.target_L3;
     size_t target_L2 = params.target_L2;
     size_t target_L1 = params.target_L1;
-    const size_t l2_cap = target_L2 * 4;
-    const size_t l1_cap = target_L1 * 4;
+    const size_t l2_cap = target_L2 * 2;
+    
+    size_t l1_cap = target_L1 * 2;
+    const size_t l1_cap_max = target_L1 * 64;
+    int consec_capped_fail = 0;
 
     const bool keep_going = params.continue_after_found &&
                             (params.fixed_runs > 0 || params.max_restarts > 0 || params.timeout_seconds > 0.0);
@@ -858,8 +907,25 @@ TerResult ter_solve(
                       << " | ms: L2=" << run_l2 * 1e3 << " sortC=" << run_sortc * 1e3
                       << " L1=" << run_l1 * 1e3 << " root=" << run_root * 1e3
                       << std::defaultfloat << std::setprecision(6);
-            if (found) std::cout << " --> SOLUTION FOUND!\n";
+    if (found) std::cout << " --> SOLUTION FOUND!\n";
             else std::cout << " --> restart...\n";
+        }
+
+        const bool all_l1_capped_this_run =
+            L1[0].size() >= l1_cap && L1[1].size() >= l1_cap && L1[2].size() >= l1_cap;
+        if (!found && all_l1_capped_this_run) {
+            if (++consec_capped_fail >= 2 && l1_cap < l1_cap_max) {
+                const size_t old_cap = l1_cap;
+                l1_cap = std::min(l1_cap_max, l1_cap * 2);
+                consec_capped_fail = 0;
+                if (params.verbose)
+                    std::cout << "[TER-ADAPT] " << old_cap << " -> " << l1_cap
+                              << ": beberapa restart beruntun penuh di L1 tanpa solusi "
+                              << "(kemungkinan solusi asli terpotong akibat wrap modulus); "
+                              << "l1_cap dinaikkan.\n";
+            }
+        } else if (found) {
+            consec_capped_fail = 0;
         }
 
         if (found) {

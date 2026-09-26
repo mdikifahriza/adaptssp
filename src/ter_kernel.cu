@@ -97,6 +97,48 @@ __global__ void level1_merge_kernel_bucket(
     }
 }
 
+__device__ inline bool check_root_sum_gpu(const TerEntry& u, const TerEntry& v, const TerEntry& w, TerEntry& out) {
+    if (!check_and_add_ternary_gpu(u, v, w, out)) return false;
+    return (out.neg_lo == 0 && out.neg_hi == 0);
+}
+
+__global__ void root_merge_kernel_bucket(
+    const TerEntry* __restrict__ d_A, size_t size_A, const TerEntry* __restrict__ d_B, size_t size_B,
+    const TerEntry* __restrict__ d_C, const uint64_t* __restrict__ d_aps, const uint64_t* __restrict__ d_bps,
+    const uint64_t* __restrict__ d_ckeys, const uint32_t* __restrict__ d_start, int shift,
+    uint64_t target_exact, TerEntry* __restrict__ d_out,
+    unsigned long long* __restrict__ d_out_count, size_t max_out_capacity, int* __restrict__ d_found_flag)
+{
+    for (size_t i_a = (size_t)blockIdx.x; i_a < size_A; i_a += (size_t)gridDim.x) {
+        if (*d_found_flag) return;
+        const uint64_t a_ps = d_aps[i_a];
+        const TerEntry u = d_A[i_a];
+        for (size_t i_b = (size_t)threadIdx.x; i_b < size_B; i_b += (size_t)blockDim.x) {
+            const uint64_t req = target_exact - a_ps - d_bps[i_b];
+            uint32_t bucket = (uint32_t)(req >> shift);
+            uint32_t end = d_start[bucket + 1];
+            uint32_t lo = d_start[bucket];
+            uint32_t hi = end;
+            while (lo < hi) {
+                uint32_t mid = lo + (hi - lo) / 2;
+                if (d_ckeys[mid] < req) lo = mid + 1; else hi = mid;
+            }
+            if (lo >= end || d_ckeys[lo] != req) continue;
+
+            const TerEntry v = d_B[i_b];
+            for (uint32_t k = lo; k < end && d_ckeys[k] == req; ++k) {
+                const TerEntry w = d_C[k];
+                TerEntry combined;
+                if (check_root_sum_gpu(u, v, w, combined)) {
+                    unsigned long long out_pos = atomicAdd(d_out_count, 1ULL);
+                    if (out_pos < max_out_capacity) d_out[out_pos] = combined;
+                    atomicExch(d_found_flag, 1);
+                }
+            }
+        }
+    }
+}
+
 namespace {
 
 using clk = std::chrono::high_resolution_clock;
@@ -418,6 +460,73 @@ bool run_level1_merge_gpu(const std::vector<TerEntry>& A, const std::vector<TerE
 {
     if (!gpu_l1_launch(A, B, sorted_C, target_mod, mask_m1, max_cap, sidecar, block_size)) return false;
     return gpu_l1_finish(L1_out);
+}
+
+namespace {
+struct RootSession {
+    DevBuf dA, dB, dC, dOut, dCnt, dAps, dBps, dCk, dSt, dFound;
+    bool inited = false;
+};
+RootSession gr;
+
+bool root_session_init() {
+    if (gr.inited) return true;
+    gr.inited = true;
+    return true;
+}
+}
+
+bool run_root_merge_gpu(
+    const std::vector<TerEntry>& A, const std::vector<TerEntry>& B, const std::vector<TerEntry>& sorted_C,
+    uint64_t target_exact, size_t max_cap, const Level1Sidecar& sidecar,
+    std::vector<TerEntry>& out, int block_size)
+{
+    if (A.empty() || B.empty() || sorted_C.empty()) return false;
+    if (!sidecar.valid || sidecar.a_ps.size() != A.size() || sidecar.b_ps.size() != B.size() ||
+        sidecar.c_keys.size() != sorted_C.size() || sidecar.start.empty()) return false;
+    if (!root_session_init()) return false;
+    if (block_size < 32 || block_size > 1024 || (block_size % 32) != 0) block_size = 256;
+    if (A.size() > SIZE_MAX / std::max<size_t>(B.size(), 1)) { std::cerr << "[GPU-root] |A|*|B| overflow\n"; return false; }
+
+    const size_t bA = A.size() * sizeof(TerEntry), bB = B.size() * sizeof(TerEntry), bC = sorted_C.size() * sizeof(TerEntry);
+    const size_t bOut = max_cap * sizeof(TerEntry);
+    const size_t bAps = A.size() * 8, bBps = B.size() * 8, bCk = sorted_C.size() * 8;
+    const size_t bSt = sidecar.start.size() * 4;
+
+    if (!gr.dA.ensure(bA, "root dA") || !gr.dB.ensure(bB, "root dB") || !gr.dC.ensure(bC, "root dC") ||
+        !gr.dOut.ensure(bOut, "root dOut") || !gr.dCnt.ensure(8, "root dCnt") || !gr.dFound.ensure(4, "root dFound") ||
+        !gr.dAps.ensure(bAps, "root dAps") || !gr.dBps.ensure(bBps, "root dBps") ||
+        !gr.dCk.ensure(bCk, "root dCk") || !gr.dSt.ensure(bSt, "root dSt")) return false;
+
+    if (!cuda_ok(cudaMemcpy(gr.dA.p, A.data(), bA, cudaMemcpyHostToDevice), "root h2d A")) return false;
+    if (!cuda_ok(cudaMemcpy(gr.dB.p, B.data(), bB, cudaMemcpyHostToDevice), "root h2d B")) return false;
+    if (!cuda_ok(cudaMemcpy(gr.dC.p, sorted_C.data(), bC, cudaMemcpyHostToDevice), "root h2d C")) return false;
+    if (!cuda_ok(cudaMemcpy(gr.dAps.p, sidecar.a_ps.data(), bAps, cudaMemcpyHostToDevice), "root h2d aps")) return false;
+    if (!cuda_ok(cudaMemcpy(gr.dBps.p, sidecar.b_ps.data(), bBps, cudaMemcpyHostToDevice), "root h2d bps")) return false;
+    if (!cuda_ok(cudaMemcpy(gr.dCk.p, sidecar.c_keys.data(), bCk, cudaMemcpyHostToDevice), "root h2d ckeys")) return false;
+    if (!cuda_ok(cudaMemcpy(gr.dSt.p, sidecar.start.data(), bSt, cudaMemcpyHostToDevice), "root h2d start")) return false;
+    if (!cuda_ok(cudaMemset(gr.dCnt.p, 0, 8), "root memset cnt")) return false;
+    if (!cuda_ok(cudaMemset(gr.dFound.p, 0, 4), "root memset found")) return false;
+
+    constexpr size_t kMaxGridBlocks = 131072;
+    size_t grid = std::min(A.size(), kMaxGridBlocks);
+    if (grid == 0) grid = 1;
+
+    root_merge_kernel_bucket<<<(unsigned)grid, (unsigned)block_size>>>(
+        (const TerEntry*)gr.dA.p, A.size(), (const TerEntry*)gr.dB.p, B.size(), (const TerEntry*)gr.dC.p,
+        (const uint64_t*)gr.dAps.p, (const uint64_t*)gr.dBps.p, (const uint64_t*)gr.dCk.p, (const uint32_t*)gr.dSt.p,
+        sidecar.shift, target_exact, (TerEntry*)gr.dOut.p, (unsigned long long*)gr.dCnt.p, max_cap, (int*)gr.dFound.p);
+    if (!cuda_ok(cudaGetLastError(), "root kernel launch")) return false;
+    if (!cuda_ok(cudaDeviceSynchronize(), "root sync")) return false;
+
+    unsigned long long h_count = 0;
+    if (!cuda_ok(cudaMemcpy(&h_count, gr.dCnt.p, 8, cudaMemcpyDeviceToHost), "root d2h count")) return false;
+    const size_t actual = std::min((size_t)h_count, max_cap);
+    out.resize(actual);
+    if (actual > 0) {
+        if (!cuda_ok(cudaMemcpy(out.data(), gr.dOut.p, actual * sizeof(TerEntry), cudaMemcpyDeviceToHost), "root d2h out")) return false;
+    }
+    return true;
 }
 
 #endif

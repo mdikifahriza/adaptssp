@@ -31,4 +31,9 @@ bool run_level1_merge_gpu(const std::vector<TerEntry>& A, const std::vector<TerE
                           const std::vector<TerEntry>& sorted_C, uint64_t target_mod, uint64_t mask_m1,
                           size_t max_cap, std::vector<TerEntry>& L1_out,
                           const Level1Sidecar* sidecar = nullptr, int block_size = 256);
+
+bool run_root_merge_gpu(
+    const std::vector<TerEntry>& A, const std::vector<TerEntry>& B, const std::vector<TerEntry>& sorted_C,
+    uint64_t target_exact, size_t max_cap, const Level1Sidecar& sidecar,
+    std::vector<TerEntry>& out, int block_size = 256);
 #endif
