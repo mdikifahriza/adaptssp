@@ -560,26 +560,35 @@ static bool merge_root_and_solve(
 #ifdef WITH_GPU
     {
         Level1Sidecar sc_root;
-        if (build_level1_sidecar(L1_A, L1_B, sorted_C, ~0ULL, 64, sc_root)) {
-            std::vector<TerEntry> gpu_candidates;
-            bool gpu_ok = run_root_merge_gpu(L1_A, L1_B, sorted_C, target_u64, 64, sc_root, gpu_candidates);
-            if (gpu_ok) {
-                for (const auto& out : gpu_candidates) {
-                    std::vector<size_t> cur_indices;
-                    ter_u128 ver_sum = 0;
-                    for (int i = 0; i < n; ++i) {
-                        bool bit_is_one = false;
-                        if (i < 64) bit_is_one = (out.pos_lo & (1ULL << i)) != 0;
-                        else bit_is_one = (out.pos_hi & (1ULL << (i - 64))) != 0;
-                        if (bit_is_one) { cur_indices.push_back(i); ver_sum += weights[i]; }
-                    }
-                    if (ver_sum == target) {
-                        sol_indices = cur_indices;
-                        return true;
-                    }
+        bool sidecar_ok = build_level1_sidecar(L1_A, L1_B, sorted_C, ~0ULL, 64, sc_root);
+        bool gpu_ok = false;
+        std::vector<TerEntry> gpu_candidates;
+        size_t verified_count = 0;
+        if (sidecar_ok) {
+            gpu_ok = run_root_merge_gpu(L1_A, L1_B, sorted_C, target_u64, 64, sc_root, gpu_candidates);
+        }
+        if (gpu_ok) {
+            for (const auto& out : gpu_candidates) {
+                std::vector<size_t> cur_indices;
+                ter_u128 ver_sum = 0;
+                for (int i = 0; i < n; ++i) {
+                    bool bit_is_one = false;
+                    if (i < 64) bit_is_one = (out.pos_lo & (1ULL << i)) != 0;
+                    else bit_is_one = (out.pos_hi & (1ULL << (i - 64))) != 0;
+                    if (bit_is_one) { cur_indices.push_back(i); ver_sum += weights[i]; }
+                }
+                if (ver_sum == target) {
+                    ++verified_count;
+                    sol_indices = cur_indices;
                 }
             }
         }
+        std::cerr << "[ROOT-GPU-DEBUG] sidecar_ok=" << sidecar_ok
+                  << " gpu_ok=" << gpu_ok
+                  << " candidates=" << gpu_candidates.size()
+                  << " verified=" << verified_count
+                  << " |A|=" << L1_A.size() << " |B|=" << L1_B.size() << " |C|=" << L1_C.size() << "\n";
+        if (verified_count > 0) return true;
     }
 #endif
 
